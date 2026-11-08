@@ -1,0 +1,102 @@
+{
+ "source": "vis-a-lot scripts/bench-db (PGlite 0.5.10 / Postgres 18.6 wasm32, Node v22.23.4)",
+ "at": "2026-11-08T17:06:23.283Z",
+ "bootMs": 3492.7130709999997,
+ "dataset": {
+  "id": "iot-1m",
+  "rows": 1000000,
+  "loadMs": 12800.816215
+ },
+ "results": [
+  {
+   "name": "scatter ts×value",
+   "medianMs": 2246.6782270000003,
+   "p95Ms": 2292.785348999998,
+   "minMs": 2087.2784519999987
+  },
+  {
+   "name": "scatter split factory×line + legend",
+   "medianMs": 2952.6764440000043,
+   "p95Ms": 3077.6253429999997,
+   "minMs": 2874.958869000002
+  },
+  {
+   "name": "scatter ts 1주 필터",
+   "medianMs": 905.7716399999917,
+   "p95Ms": 931.4968850000005,
+   "minMs": 895.5339569999996
+  },
+  {
+   "name": "bar avg value by machine split factory",
+   "medianMs": 345.43160300000454,
+   "p95Ms": 374.60154400000465,
+   "minMs": 344.77297700000054
+  },
+  {
+   "name": "bar median by line legend sensor",
+   "medianMs": 1260.6980780000013,
+   "p95Ms": 1591.0690139999933,
+   "minMs": 1157.267491999999
+  },
+  {
+   "name": "boxplot value by sensor_type",
+   "medianMs": 2133.6101389999967,
+   "p95Ms": 2278.5520879999967,
+   "minMs": 1992.2583799999993
+  },
+  {
+   "name": "histogram value split sensor",
+   "medianMs": 596.0121539999964,
+   "p95Ms": 668.5889889999962,
+   "minMs": 571.9059930000076
+  },
+  {
+   "name": "heatmap ts×machine avg",
+   "medianMs": 1411.2638119999901,
+   "p95Ms": 1480.2900669999945,
+   "minMs": 1375.3674449999962
+  },
+  {
+   "name": "legendValues sensor_type",
+   "medianMs": 246.69095199998992,
+   "p95Ms": 286.04944600000454,
+   "minMs": 245.56187999999383
+  },
+  {
+   "name": "columnSummary machine",
+   "medianMs": 224.52520399999048,
+   "p95Ms": 228.30075500000385,
+   "minMs": 217.13100999999733
+  },
+  {
+   "name": "columnSummary ts",
+   "medianMs": 479.46356899999955,
+   "p95Ms": 506.75900599999295,
+   "minMs": 477.83008299999346
+  },
+  {
+   "name": "splitCount 3컬럼",
+   "medianMs": 346.95166900000186,
+   "p95Ms": 353.23148200000287,
+   "minMs": 339.0405129999999
+  },
+  {
+   "name": "splitCount 필터",
+   "medianMs": 259.17728299999726,
+   "p95Ms": 277.84935699999915,
+   "minMs": 252.3379010000208
+  },
+  {
+   "name": "sampleRows 필터 1페이지",
+   "medianMs": 698.0833109999949,
+   "p95Ms": 738.8598310000089,
+   "minMs": 682.3140499999863
+  },
+  {
+   "name": "itemRows split 조합 1페이지",
+   "medianMs": 338.3289189999923,
+   "p95Ms": 365.4660220000078,
+   "minMs": 309.2723330000008
+  }
+ ]
+}

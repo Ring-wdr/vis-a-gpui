@@ -1,0 +1,65 @@
+{
+  "draw": [
+    {
+      "items": 1,
+      "items_per_sec": 41.412061859350224,
+      "name": "scatter ts×value (1 item)",
+      "png": true,
+      "query_ms": 0.463391,
+      "total_ms": 24.147554000000003,
+      "workers": 3
+    },
+    {
+      "items": 12,
+      "items_per_sec": 464.0867978444096,
+      "name": "scatter split factory×line + legend (12 items)",
+      "png": true,
+      "query_ms": 1.560702,
+      "total_ms": 25.857232,
+      "workers": 3
+    },
+    {
+      "items": 120,
+      "items_per_sec": 571.1187531030786,
+      "name": "line split machine (120 items)",
+      "png": true,
+      "query_ms": 1.7409240000000001,
+      "total_ms": 210.11392,
+      "workers": 3
+    },
+    {
+      "items": 12,
+      "items_per_sec": 372.05055757821873,
+      "name": "bar avg machine split sensor×shift (12 items)",
+      "png": true,
+      "query_ms": 2.0551380000000004,
+      "total_ms": 32.253681,
+      "workers": 3
+    },
+    {
+      "items": 120,
+      "items_per_sec": 5645.111326534831,
+      "name": "boxplot sensor split machine (120 items)",
+      "png": true,
+      "query_ms": 2.646773,
+      "total_ms": 21.257331,
+      "workers": 3
+    },
+    {
+      "items": 2500,
+      "items_per_sec": 4889.730389322113,
+      "name": "histogram value split lot_id (~5,000 items)",
+      "png": true,
+      "query_ms": 3.3741320000000004,
+      "total_ms": 511.275633,
+      "workers": 3
+    }
+  ],
+  "generateMs": 10.15162,
+  "iterations": 5,
+  "reopenMs": 7.312028,
+  "rows": 100000,
+  "saveMs": 4.895448,
+  "threads": 4,
+  "workers": 3
+}

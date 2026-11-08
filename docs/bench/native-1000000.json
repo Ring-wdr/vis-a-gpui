@@ -1,0 +1,172 @@
+{
+  "data": [
+    {
+      "median_ms": 13.404802,
+      "min_ms": 12.885506,
+      "name": "scatter ts×value",
+      "p95_ms": 14.947562,
+      "runs": 5
+    },
+    {
+      "median_ms": 24.805625000000003,
+      "min_ms": 20.2847,
+      "name": "scatter split factory×line + legend",
+      "p95_ms": 26.029726999999998,
+      "runs": 5
+    },
+    {
+      "median_ms": 2.418015,
+      "min_ms": 2.1164840000000003,
+      "name": "scatter ts 1주 필터",
+      "p95_ms": 2.4368,
+      "runs": 5
+    },
+    {
+      "median_ms": 10.784595,
+      "min_ms": 10.495898,
+      "name": "bar avg value by machine split factory",
+      "p95_ms": 11.882237,
+      "runs": 5
+    },
+    {
+      "median_ms": 17.059637,
+      "min_ms": 15.779926,
+      "name": "bar median by line legend sensor",
+      "p95_ms": 20.614506000000002,
+      "runs": 5
+    },
+    {
+      "median_ms": 17.22344,
+      "min_ms": 16.327973999999998,
+      "name": "boxplot value by sensor_type",
+      "p95_ms": 17.747173,
+      "runs": 5
+    },
+    {
+      "median_ms": 12.940797,
+      "min_ms": 12.370547,
+      "name": "histogram value split sensor",
+      "p95_ms": 13.281039,
+      "runs": 5
+    },
+    {
+      "median_ms": 5.393443,
+      "min_ms": 5.253572,
+      "name": "heatmap ts×machine avg",
+      "p95_ms": 5.545475000000001,
+      "runs": 5
+    },
+    {
+      "median_ms": 0.00015900000000000002,
+      "min_ms": 0.00012800000000000002,
+      "name": "legendValues sensor_type",
+      "p95_ms": 0.000568,
+      "runs": 5
+    },
+    {
+      "median_ms": 0.301721,
+      "min_ms": 0.25724199999999997,
+      "name": "columnSummary machine",
+      "p95_ms": 0.41562800000000005,
+      "runs": 5
+    },
+    {
+      "median_ms": 1.173831,
+      "min_ms": 1.1352689999999999,
+      "name": "columnSummary ts",
+      "p95_ms": 1.197053,
+      "runs": 5
+    },
+    {
+      "median_ms": 20.607686,
+      "min_ms": 16.943098,
+      "name": "splitCount 3컬럼",
+      "p95_ms": 21.70895,
+      "runs": 5
+    },
+    {
+      "median_ms": 3.631346,
+      "min_ms": 3.438297,
+      "name": "splitCount 필터",
+      "p95_ms": 3.806907,
+      "runs": 5
+    },
+    {
+      "median_ms": 1.110775,
+      "min_ms": 1.086056,
+      "name": "sampleRows 필터 1페이지",
+      "p95_ms": 1.5541369999999999,
+      "runs": 5
+    },
+    {
+      "median_ms": 1.068014,
+      "min_ms": 1.057339,
+      "name": "itemRows split 조합 1페이지",
+      "p95_ms": 1.144995,
+      "runs": 5
+    }
+  ],
+  "draw": [
+    {
+      "items": 1,
+      "items_per_sec": 7.694390031000543,
+      "name": "scatter ts×value (1 item)",
+      "png": false,
+      "query_ms": 2.36413,
+      "total_ms": 129.964818,
+      "workers": 3
+    },
+    {
+      "items": 12,
+      "items_per_sec": 92.64846905585142,
+      "name": "scatter split factory×line + legend (12 items)",
+      "png": false,
+      "query_ms": 13.351740000000001,
+      "total_ms": 129.521838,
+      "workers": 3
+    },
+    {
+      "items": 120,
+      "items_per_sec": 339.0614736591533,
+      "name": "line split machine (120 items)",
+      "png": false,
+      "query_ms": 16.551002,
+      "total_ms": 353.918122,
+      "workers": 3
+    },
+    {
+      "items": 12,
+      "items_per_sec": 240.07923575096726,
+      "name": "bar avg machine split sensor×shift (12 items)",
+      "png": false,
+      "query_ms": 15.755622,
+      "total_ms": 49.983498000000004,
+      "workers": 3
+    },
+    {
+      "items": 120,
+      "items_per_sec": 2296.8186382238855,
+      "name": "boxplot sensor split machine (120 items)",
+      "png": false,
+      "query_ms": 31.301661000000003,
+      "total_ms": 52.24618,
+      "workers": 3
+    },
+    {
+      "items": 4941,
+      "items_per_sec": 4089.6476421751495,
+      "name": "histogram value split lot_id (~5,000 items)",
+      "png": false,
+      "query_ms": 30.445705,
+      "total_ms": 1208.1725450000001,
+      "workers": 3
+    }
+  ],
+  "generateMs": 84.587751,
+  "iterations": 5,
+  "reopenMs": 73.64135300000001,
+  "rows": 1000000,
+  "saveMs": 53.143374,
+  "threads": 4,
+  "workers": 3
+}

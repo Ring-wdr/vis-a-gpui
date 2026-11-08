@@ -1,0 +1,105 @@
+{
+  "dataset": "iot-100k",
+  "at": "2026-11-08T17:57:07.584Z",
+  "loadMs": 4556.600000000093,
+  "draws": [
+    {
+      "name": "scatter ts×value (1 item)",
+      "items": 1,
+      "status": "success",
+      "workers": 3,
+      "totalMs": 432,
+      "queryMs": 192,
+      "serverMs": 403,
+      "counts": {
+        "queued": 0,
+        "running": 0,
+        "success": 1,
+        "failed": 0,
+        "cancelled": 0
+      }
+    },
+    {
+      "name": "scatter split factory×line + legend (12 items)",
+      "items": 12,
+      "status": "success",
+      "workers": 3,
+      "totalMs": 563,
+      "queryMs": 286,
+      "serverMs": 554,
+      "counts": {
+        "queued": 0,
+        "running": 0,
+        "success": 12,
+        "failed": 0,
+        "cancelled": 0
+      }
+    },
+    {
+      "name": "line split machine (120 items)",
+      "items": 120,
+      "status": "success",
+      "workers": 3,
+      "totalMs": 1534.6999999997206,
+      "queryMs": 236,
+      "serverMs": 1522,
+      "counts": {
+        "queued": 0,
+        "running": 0,
+        "success": 120,
+        "failed": 0,
+        "cancelled": 0
+      }
+    },
+    {
+      "name": "bar avg machine split sensor×shift (12 items)",
+      "items": 12,
+      "status": "success",
+      "workers": 3,
+      "totalMs": 200.5,
+      "queryMs": 105,
+      "serverMs": 176,
+      "counts": {
+        "queued": 0,
+        "running": 0,
+        "success": 12,
+        "failed": 0,
+        "cancelled": 0
+      }
+    },
+    {
+      "name": "boxplot sensor split machine (120 items)",
+      "items": 120,
+      "status": "success",
+      "workers": 3,
+      "totalMs": 800.7999999998137,
+      "queryMs": 429,
+      "serverMs": 767,
+      "counts": {
+        "queued": 0,
+        "running": 0,
+        "success": 120,
+        "failed": 0,
+        "cancelled": 0
+      }
+    },
+    {
+      "name": "histogram value split lot_id (~5,000 items)",
+      "items": 2500,
+      "status": "success",
+      "workers": 3,
+      "totalMs": 7221.199999999721,
+      "queryMs": 311,
+      "serverMs": 7187,
+      "counts": {
+        "queued": 0,
+        "running": 0,
+        "success": 2500,
+        "failed": 0,
+        "cancelled": 0
+      }
+    }
+  ],
+  "cores": 4,
+  "ua": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/153.0.8010.12 Safari/537.36"
+}

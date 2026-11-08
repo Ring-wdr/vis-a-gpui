@@ -1,0 +1,42 @@
+name: build
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    # Windows release 빌드는 gpui가 HLSL 셰이더를 Windows SDK의 fxc.exe로 미리 컴파일하므로 Windows 러너에서 만든다.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: test (vis-core)
+        run: cargo test -p vis-core --release
+      - name: build
+        run: cargo build --release -p vis-a-gpui -p vis-core
+      - name: bench (headless, 10만 행)
+        run: target/release/vis-bench.exe --rows 100000 --iterations 3 --out bench-windows-100k.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vis-a-gpui-windows-x64
+          path: |
+            target/release/vis-a-gpui.exe
+            target/release/vis-bench.exe
+            bench-windows-100k.json
+
+  linux-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: system packages
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libvulkan-dev libx11-xcb-dev libfontconfig-dev fonts-nanum
+      - name: test
+        run: cargo test -p vis-core --release
+      - name: build
+        run: cargo build --release -p vis-a-gpui
