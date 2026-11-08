@@ -4,10 +4,14 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
+use gpui_kit::component::empty::{Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyMediaVariant, EmptyTitle};
 use gpui_kit::component::progress::Progress;
 use gpui_kit::component::tab::{Tab, TabBar};
-use gpui_kit::component::{ActiveTheme as _, Disableable as _, IconName, Sizable as _, Theme, ThemeMode, WindowExt as _, h_flex, v_flex};
+use gpui_kit::component::table::{Table, TableBody, TableCell, TableHead, TableHeader, TableRow};
+use gpui_kit::component::{
+    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, Theme, ThemeMode, WindowExt as _, h_flex, v_flex,
+};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -162,6 +166,59 @@ impl VisApp {
             }
             let _ = this.update(cx, |this, _| this.poll = None);
         }));
+    }
+
+    /// 지우기 전에 묻는다 (gpui-kit AlertDialog, 위험 동작 버튼, 처음 포커스는 취소)
+    fn confirm_delete_dataset(&mut self, id: String, name: String, window: &mut Window, cx: &mut Context<Self>) {
+        let ent = cx.entity().downgrade();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let (ent, id) = (ent.clone(), id.clone());
+            alert
+                .title(format!("'{name}'을 지울까요?"))
+                .description("저장한 데이터 파일을 지웁니다. 샘플은 다시 등록할 수 있습니다.")
+                .confirm()
+                .ok_text("삭제")
+                .cancel_text("취소")
+                .ok_variant(ButtonVariant::Danger)
+                .on_ok(move |_, _, cx| {
+                    let _ = ent.update(cx, |this, cx| {
+                        this.store.delete(&id);
+                        cx.notify();
+                    });
+                    true
+                })
+        });
+    }
+
+    fn confirm_delete_history(&mut self, id: String, title: String, window: &mut Window, cx: &mut Context<Self>) {
+        let ent = cx.entity().downgrade();
+        let thumb = self.history.thumb_path(&id);
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let (ent, id) = (ent.clone(), id.clone());
+            alert
+                .title("이 기록을 지울까요?")
+                .description(
+                    v_flex()
+                        .gap_2()
+                        .when(thumb.exists(), |d| d.child(img(thumb.clone()).w(px(256.)).h(px(160.)).rounded_sm()))
+                        .child(title.clone()),
+                )
+                .confirm()
+                .ok_text("삭제")
+                .cancel_text("취소")
+                .ok_variant(ButtonVariant::Danger)
+                .on_ok(move |_, _, cx| {
+                    let _ = ent.update(cx, |this, cx| {
+                        this.history.remove(&id);
+                        if let Some(i) = this.history_tabs.iter().position(|(h, _)| *h == id) {
+                            this.history_tabs.remove(i);
+                            this.history_active = None;
+                        }
+                        cx.notify();
+                    });
+                    true
+                })
+        });
     }
 
     fn open_history(&mut self, id: &str, edit: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -324,22 +381,12 @@ impl VisApp {
 
     fn datastore_view(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
-        let mut rows = v_flex().gap_1();
-        rows = rows.child(
-            h_flex()
-                .px_3()
-                .py_1()
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .child(div().flex_1().child("이름"))
-                .child(div().w(px(120.)).child("행 수"))
-                .child(div().w(px(100.)).child("크기"))
-                .child(div().w(px(110.)).child("적재 시간"))
-                .child(div().w(px(260.)).child("상태")),
-        );
+        // 데이터 목록 (gpui-kit Table): 업로드(최근 순) 다음에 샘플
+        let mut body = TableBody::new();
         for (info, state) in self.store.list() {
             let id = info.id.clone();
             let (id1, id2, id3) = (id.clone(), id.clone(), id.clone());
+            let name = info.name.clone();
             let status: AnyElement = match &state {
                 DatasetState::Unregistered => Button::new(SharedString::from(format!("reg-{id}")))
                     .label("등록 (생성)")
@@ -367,45 +414,51 @@ impl VisApp {
                             .small()
                             .ghost()
                             .tooltip("삭제")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.store.delete(&id3);
-                                cx.notify();
-                            })),
+                            .on_click(
+                                cx.listener(move |this, _, window, cx| this.confirm_delete_dataset(id3.clone(), name.clone(), window, cx)),
+                            ),
                     )
                     .into_any_element(),
                 DatasetState::Failed(e) => div().text_color(theme.danger).child(e.clone()).into_any_element(),
             };
-            rows = rows.child(
-                h_flex()
-                    .px_3()
-                    .py_2()
-                    .rounded_md()
-                    .bg(theme.background)
-                    .border_1()
-                    .border_color(theme.border)
-                    .child(v_flex().flex_1().child(div().text_sm().child(info.name.clone())).child(
-                        div().text_xs().text_color(theme.muted_foreground).child(format!(
-                            "{}{}",
-                            info.id,
-                            if info.sample { " · 샘플" } else { " · 업로드" }
-                        )),
-                    ))
-                    .child(div().w(px(120.)).text_sm().child(fmt_int(info.rows)))
+            body = body.child(
+                TableRow::new()
                     .child(
-                        div()
+                        TableCell::new().child(v_flex().child(div().text_sm().child(info.name.clone())).child(
+                            div().text_xs().text_color(theme.muted_foreground).child(format!(
+                                "{}{}",
+                                info.id,
+                                if info.sample { " · 샘플" } else { " · 업로드" }
+                            )),
+                        )),
+                    )
+                    .child(TableCell::new().w(px(120.)).text_right().child(fmt_int(info.rows)))
+                    .child(
+                        TableCell::new()
                             .w(px(100.))
-                            .text_sm()
+                            .text_right()
                             .child(if info.bytes > 0 { fmt_bytes(info.bytes) } else { "-".into() }),
                     )
-                    .child(
-                        div()
-                            .w(px(110.))
-                            .text_sm()
-                            .child(if info.load_ms > 0.0 { fmt_ms(info.load_ms) } else { "-".into() }),
-                    )
-                    .child(div().w(px(260.)).child(status)),
+                    .child(TableCell::new().w(px(110.)).text_right().child(if info.load_ms > 0.0 {
+                        fmt_ms(info.load_ms)
+                    } else {
+                        "-".into()
+                    }))
+                    .child(TableCell::new().w(px(280.)).child(status)),
             );
         }
+        let rows = Table::new()
+            .child(
+                TableHeader::new().child(
+                    TableRow::new()
+                        .child(TableHead::new().child("이름"))
+                        .child(TableHead::new().w(px(120.)).text_right().child("행 수"))
+                        .child(TableHead::new().w(px(100.)).text_right().child("크기"))
+                        .child(TableHead::new().w(px(110.)).text_right().child("적재 시간"))
+                        .child(TableHead::new().w(px(280.)).child("상태")),
+                ),
+            )
+            .child(body);
         let csv_busy = self.working.iter().any(|w| w.starts_with("csv:"));
         v_flex()
             .size_full()
@@ -488,15 +541,21 @@ impl VisApp {
         let entries = self.history.list();
         if entries.is_empty() {
             list = list.child(
-                div()
-                    .p_4()
-                    .text_sm()
-                    .text_color(theme.muted_foreground)
-                    .child("아직 그린 차트가 없습니다. gallery에서 draw하면 여기에 남습니다."),
+                Empty::new().header(
+                    EmptyHeader::new()
+                        .media(
+                            EmptyMedia::new()
+                                .with_variant(EmptyMediaVariant::Icon)
+                                .child(Icon::new(IconName::Inbox)),
+                        )
+                        .title(EmptyTitle::new().child("기록 없음"))
+                        .description(EmptyDescription::new().child("gallery에서 draw하면 여기에 남습니다.")),
+                ),
             );
         }
         for e in entries {
             let (id1, id2, id3) = (e.id.clone(), e.id.clone(), e.id.clone());
+            let summary = e.spec.summary();
             let thumb = self.history.thumb_path(&e.id);
             let when = vis_core::timefmt::format_kst(e.created_ms as f64, "%m/%d %H:%M");
             let active = self
@@ -542,14 +601,9 @@ impl VisApp {
                                     .xsmall()
                                     .ghost()
                                     .tooltip("삭제")
-                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                    .on_click(cx.listener(move |this, _, window, cx| {
                                         cx.stop_propagation();
-                                        this.history.remove(&id3);
-                                        if let Some(i) = this.history_tabs.iter().position(|(h, _)| *h == id3) {
-                                            this.history_tabs.remove(i);
-                                            this.history_active = None;
-                                        }
-                                        cx.notify();
+                                        this.confirm_delete_history(id3.clone(), summary.clone(), window, cx);
                                     })),
                             ),
                     ),

@@ -3,7 +3,10 @@
 
 mod app;
 mod bench_view;
+mod data_table;
 mod filters;
+mod picker;
+mod settings;
 mod ui;
 mod workspace;
 

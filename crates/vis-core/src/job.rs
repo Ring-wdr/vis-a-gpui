@@ -172,8 +172,10 @@ pub struct RenderedItem {
     pub worker: usize,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct RenderOptions {
+    /// 공통 속성 덮어쓰기. 화면에서 전체 설정을 바꾸면 쿼리를 다시 하지 않고 이 값으로 다시 그린다
+    pub common: Option<crate::spec::CommonProps>,
     pub width: f32,
     pub height: f32,
     pub scale: f32,
@@ -192,18 +194,45 @@ pub fn render_item(
     compact: bool,
     size: (f32, f32),
 ) -> crate::render::Rendered {
-    let spec = &data.spec;
-    let color = parse_hex(&spec.common.color).unwrap_or(palette(0));
+    let spec_owned;
+    let spec = match &opts.common {
+        Some(c) => {
+            let mut sp = data.spec.clone();
+            sp.common = c.clone();
+            spec_owned = sp;
+            &spec_owned
+        }
+        None => &data.spec,
+    };
+    // 색 결정 순서: item 개별 → 공통 속성 → 팔레트 기본 색 (원본 4.7)
+    let color = state
+        .color
+        .as_deref()
+        .and_then(parse_hex)
+        .or_else(|| parse_hex(&spec.common.color))
+        .unwrap_or(palette(0));
     let alpha = 1.0 - spec.common.transparency.clamp(0.0, 0.95);
     let hidden_of = |values: &[String]| values.iter().map(|v| state.hidden_legend.contains(v)).collect::<Vec<_>>();
     let mk_legend = |title: &str, values: Vec<String>, colors: Vec<u32>| {
         let hidden = hidden_of(&values);
+        let colors = values
+            .iter()
+            .zip(colors)
+            .map(|(v, c)| {
+                state
+                    .legend_colors
+                    .get(v)
+                    .or_else(|| spec.common.legend_colors.get(v))
+                    .and_then(|h| parse_hex(h))
+                    .unwrap_or(c)
+            })
+            .collect();
         Some(LegendInput {
             title: title.into(),
             values,
             colors,
             hidden,
-            position: spec.common.legend_position,
+            position: state.legend_position.unwrap_or(spec.common.legend_position),
         })
     };
     let mut legend = data
@@ -474,7 +503,7 @@ pub fn start(req: JobRequest) -> Job {
             let next = AtomicUsize::new(0);
             std::thread::scope(|scope| {
                 for w in 0..workers {
-                    let (s, next, p, states) = (s, &next, &p, &states);
+                    let (s, next, p, states, opts) = (s, &next, &p, &states, &opts);
                     std::thread::Builder::new()
                         .name(format!("vis-render-{w}"))
                         .spawn_scoped(scope, move || {
@@ -491,7 +520,7 @@ pub fn start(req: JobRequest) -> Job {
                                 let t0 = Instant::now();
                                 let state = states(i);
                                 let out =
-                                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| render_once(&s.data, i, &state, &opts, w)));
+                                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| render_once(&s.data, i, &state, opts, w)));
                                 p.running.fetch_sub(1, Ordering::AcqRel);
                                 match out {
                                     Ok(mut item) => {

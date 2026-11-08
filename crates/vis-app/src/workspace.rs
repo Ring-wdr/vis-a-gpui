@@ -8,9 +8,17 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::button::{Button, ButtonVariants as _, Toggle, ToggleGroup};
+use gpui_kit::component::empty::{Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyMediaVariant, EmptyTitle};
+use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
+use gpui_kit::component::popover::{Popover, PopoverState};
 use gpui_kit::component::progress::Progress;
-use gpui_kit::component::{ActiveTheme as _, Disableable as _, IconName, Sizable as _, WindowExt as _, h_flex, v_flex};
+use gpui_kit::component::skeleton::Skeleton;
+use gpui_kit::component::status_bar::StatusBar;
+use gpui_kit::component::tag::Tag;
+use gpui_kit::component::{
+    ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _, WindowExt as _, h_flex, v_flex,
+};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use parking_lot::Mutex;
@@ -19,12 +27,14 @@ use vis_core::dataset::{ColumnKind, ColumnSchema, Dataset};
 use vis_core::history::{History, HistoryEntry};
 use vis_core::job::{self, ChartData, Job, JobRequest, JobStage, RenderOptions, RenderedItem};
 use vis_core::render::meta::{AxisKind, ItemMeta};
-use vis_core::render::theme::{PALETTE, parse_hex};
-use vis_core::spec::{AGG_FNS, AggFn, CHART_TYPES, ChartSpec, ChartTheme, ChartType, CommonProps, ItemState, ItemView, LegendPosition};
+use vis_core::render::theme::{hex, palette};
+use vis_core::spec::{AGG_FNS, AggFn, CHART_TYPES, ChartSpec, ChartTheme, ChartType, CommonProps, ItemState, ItemView};
 use vis_core::store::Store;
 
 use crate::filters::FilterPanel;
-use crate::ui::{dropdown, field, fmt_int, fmt_ms, hex_color, render_image};
+use crate::picker::Picker;
+use crate::settings::{PropsPanel, Target};
+use crate::ui::{field, fmt_int, fmt_ms, hex_color, render_image};
 
 /// 화면에 올린 이미지가 이 바이트를 넘으면 보이지 않는 item부터 내린다 (원본은 PNG를 Cache API에 뒀다)
 const IMAGE_BUDGET: usize = 768 * 1024 * 1024;
@@ -125,6 +135,20 @@ pub struct Workspace {
     enlarged: Option<usize>,
     /// 그리드 크기를 알면 바로 draw (history에서 열 때)
     auto_draw: bool,
+    /// 설정 패널의 gpui-kit Select들
+    pickers: Pickers,
+    /// grid 크기 고르기 popover에서 가리킨 칸 (행, 열)
+    grid_hover: Rc<Cell<(u32, u32)>>,
+    _subs: Vec<Subscription>,
+}
+
+struct Pickers {
+    dataset: Picker,
+    x: Picker,
+    y: Picker,
+    z: Picker,
+    legend: Picker,
+    agg: Picker,
 }
 
 impl Workspace {
@@ -134,6 +158,31 @@ impl Workspace {
             .unwrap_or_else(|| "iot-100k".into());
         let spec = default_spec(&ds_id, store.get(&ds_id).as_deref());
         let filters = cx.new(|cx| FilterPanel::new(store.clone(), ds_id.clone(), window, cx));
+        let mut subs = vec![];
+        let mut mk = |ph: &str, search: bool, f: fn(&mut Workspace, String, &mut Window, &mut Context<Workspace>)| {
+            let (p, sub) = Picker::new(ph.to_string(), search, window, cx, move |this: &mut Workspace, v, window, cx| {
+                f(this, v, window, cx);
+                let schema = this.schema();
+                fix_spec(&mut this.spec, &schema);
+                cx.emit(WorkspaceEvent::Title);
+                cx.notify();
+            });
+            subs.push(sub);
+            p
+        };
+        let pickers = Pickers {
+            dataset: mk("데이터 없음", true, |this, v, window, cx| {
+                this.spec.dataset = v.clone();
+                this.filters.update(cx, |f, cx| f.set_dataset(v, window, cx));
+            }),
+            x: mk("x 컬럼", true, |this, v, _, _| this.spec.x = v),
+            y: mk("y 컬럼", true, |this, v, _, _| this.spec.y = v),
+            z: mk("값 컬럼", true, |this, v, _, _| this.spec.z = Some(v)),
+            legend: mk("없음", false, |this, v, _, _| this.spec.legend = (!v.is_empty()).then_some(v)),
+            agg: mk("통계 함수", false, |this, v, _, _| {
+                this.spec.agg = AGG_FNS.iter().copied().find(|a| a.label() == v).unwrap_or_default()
+            }),
+        };
         Self {
             store,
             history,
@@ -157,6 +206,9 @@ impl Workspace {
             pending_history: None,
             enlarged: None,
             auto_draw: false,
+            pickers,
+            grid_hover: Rc::new(Cell::new((0, 0))),
+            _subs: subs,
         }
     }
 
@@ -226,6 +278,7 @@ impl Workspace {
 
     fn render_opts(&self, size: (f32, f32), window: &Window, cx: &App) -> RenderOptions {
         RenderOptions {
+            common: self.drawn.as_ref().map(|d| d.spec.common.clone()),
             width: size.0,
             height: size.1,
             scale: window.scale_factor().clamp(1.0, 3.0),
@@ -454,6 +507,7 @@ impl Workspace {
             // 섬네일: 첫 item을 그림 영역만 작게
             let thumb = (!data.is_empty()).then(|| {
                 let opts = RenderOptions {
+                    common: Some(d.spec.common.clone()),
                     width: 256.0,
                     height: 160.0,
                     scale: 1.0,
@@ -801,6 +855,120 @@ impl Workspace {
         cx.notify();
     }
 
+    /// 전체 설정 적용: 공통 속성을 바꾸고 item 개별 속성을 덮어쓴 뒤 전체를 다시 그린다 (원본 4.8)
+    pub fn apply_common(&mut self, common: CommonProps, window: &mut Window, cx: &mut Context<Self>) {
+        self.spec.common = common.clone();
+        if let Some(d) = self.drawn.as_mut() {
+            d.spec.common = common;
+            for s in d.states.lock().iter_mut() {
+                s.color = None;
+                s.legend_colors.clear();
+                s.legend_position = None;
+            }
+            // 쿼리는 그대로 두고 그림만: 보이는 item부터, 나머지는 페이지를 넘길 때 그린다
+            for (_, img) in d.images.drain() {
+                cx.drop_image(img.image, Some(window));
+            }
+            d.lru.clear();
+            d.image_bytes = 0;
+            if let (Some(id), Some(data)) = (&d.history_id, &d.data) {
+                let map = item_map(data, &d.states.lock());
+                let spec = d.spec.clone();
+                self.history.update(id, |e| {
+                    e.items = map;
+                    e.spec.common = spec.common;
+                });
+            }
+            self.refresh_visible(window, cx);
+            if self.enlarged.is_some() {
+                self.redraw_big(window, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// item 개별 속성 (⚙ 다이얼로그)
+    pub fn apply_item_props(&mut self, i: usize, f: impl FnOnce(&mut ItemState), window: &mut Window, cx: &mut Context<Self>) {
+        self.update_state(i, window, cx, f);
+    }
+
+    /// legend 값과 지금 색 (속성 다이얼로그). item이 있으면 그 item의 개별 색을 먼저 본다
+    fn legend_colors_of(&self, item: Option<usize>) -> Vec<(String, String)> {
+        let Some(d) = &self.drawn else {
+            let Some(ds) = self.dataset() else { return vec![] };
+            let Some(l) = self.spec.legend.as_deref().filter(|_| self.spec.chart_type.fields().legend) else {
+                return vec![];
+            };
+            let values = vis_core::query::summary::legend_values(&ds, l).unwrap_or_default();
+            return values
+                .into_iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    let c = self.spec.common.legend_colors.get(&v).cloned().unwrap_or_else(|| hex(palette(i)));
+                    (v, c)
+                })
+                .collect();
+        };
+        // 그린 item의 legend (pie·funnel·sankey처럼 item마다 legend가 다른 차트도)
+        let meta = item.and_then(|i| d.images.get(&i)).map(|img| img.meta.clone());
+        let values: Vec<String> = match (&meta, &d.data) {
+            (Some(m), _) if !m.legend.is_empty() => m.legend.iter().map(|l| l.value.clone()).collect(),
+            (_, Some(data)) => data.legend_values.clone().unwrap_or_default(),
+            _ => vec![],
+        };
+        let state = item.and_then(|i| d.states.lock().get(i).cloned()).unwrap_or_default();
+        values
+            .into_iter()
+            .enumerate()
+            .map(|(k, v)| {
+                let c = state
+                    .legend_colors
+                    .get(&v)
+                    .or_else(|| d.spec.common.legend_colors.get(&v))
+                    .cloned()
+                    .unwrap_or_else(|| hex(palette(k)));
+                (v, c)
+            })
+            .collect()
+    }
+
+    fn open_common_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let ws = cx.entity().downgrade();
+        let common = self
+            .drawn
+            .as_ref()
+            .map(|d| d.spec.common.clone())
+            .unwrap_or_else(|| self.spec.common.clone());
+        let legend = self.legend_colors_of(None);
+        let panel = cx.new(|cx| PropsPanel::new(ws, Target::Common, &common, None, legend, window, cx));
+        PropsPanel::open(panel, "전체 설정 (공통 속성)".into(), window, cx);
+    }
+
+    fn open_item_settings(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(d) = &self.drawn else { return };
+        let ws = cx.entity().downgrade();
+        let common = d.spec.common.clone();
+        let state = d.states.lock().get(i).cloned().unwrap_or_default();
+        let name = d.data.as_ref().map(|data| data.item_name(i)).unwrap_or_default();
+        let legend = self.legend_colors_of(Some(i));
+        let panel = cx.new(|cx| PropsPanel::new(ws, Target::Item(i), &common, Some(&state), legend, window, cx));
+        PropsPanel::open(panel, format!("개별 속성 · {name}"), window, cx);
+    }
+
+    /// 고른 item의 데이터 테이블 (draw 필터 + split 조합 + 숨긴 legend 값 제외)
+    fn open_data_table(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(d) = &self.drawn else { return };
+        let Some(data) = &d.data else { return };
+        let mut rows = data.groups.rows_of(i).to_vec();
+        let hidden = d.states.lock().get(i).map(|s| s.hidden_legend.clone()).unwrap_or_default();
+        if let (false, Some(l)) = (hidden.is_empty(), d.spec.legend.as_deref()) {
+            if let Some(col) = d.dataset.column(l) {
+                rows.retain(|&r| !hidden.contains(&col.text_at(r as usize)));
+            }
+        }
+        crate::data_table::open(data.item_name(i), d.dataset.clone(), rows, d.spec.filters.len(), window, cx);
+    }
+
     fn on_grid_resized(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.auto_draw {
             self.auto_draw = false;
@@ -910,26 +1078,54 @@ pub fn fix_spec(spec: &mut ChartSpec, schema: &[ColumnSchema]) {
 // ── 화면 ─────────────────────────────────────────────────────────────
 
 impl Workspace {
-    fn render_left(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn render_left(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let schema = self.schema();
         let spec = self.spec.clone();
         let fields = spec.chart_type.fields();
         let entity = cx.entity().downgrade();
         let running = self.is_running();
         let ro = self.read_only;
-        let ready: Vec<(SharedString, String)> = self.store.ready().into_iter().map(|d| (SharedString::from(d.name), d.id)).collect();
-        let ds_name = ready
-            .iter()
-            .find(|(_, id)| *id == spec.dataset)
-            .map(|(n, _)| n.clone())
-            .unwrap_or_else(|| "데이터 없음".into());
+
+        // ── gpui-kit Select: 선택지와 선택값을 지금 설정에 맞춘다 ──
+        let col_opts = |kinds: &[ColumnKind]| -> Vec<(String, String)> {
+            schema
+                .iter()
+                .filter(|c| kinds.contains(&c.kind))
+                .map(|c| (format!("{} ({})", c.label, c.name), c.name.clone()))
+                .collect()
+        };
+        let ready: Vec<(String, String)> = self.store.ready().into_iter().map(|d| (d.name, d.id)).collect();
+        self.pickers.dataset.sync(ready, Some(spec.dataset.clone()), window, cx);
+        self.pickers.x.sync(col_opts(fields.x), Some(spec.x.clone()), window, cx);
+        if let Some(k) = fields.y {
+            self.pickers.y.sync(col_opts(k), Some(spec.y.clone()), window, cx);
+        }
+        if let Some(k) = fields.z {
+            self.pickers.z.sync(col_opts(k), spec.z.clone(), window, cx);
+        }
+        let mut legend_opts = vec![("없음".to_string(), String::new())];
+        legend_opts.extend(
+            schema
+                .iter()
+                .filter(|c| c.kind == ColumnKind::Categorical && c.distinct.unwrap_or(99) <= 8)
+                .map(|c| (format!("{} ({})", c.label, c.name), c.name.clone())),
+        );
+        self.pickers
+            .legend
+            .sync(legend_opts, Some(spec.legend.clone().unwrap_or_default()), window, cx);
+        self.pickers.agg.sync(
+            AGG_FNS.iter().map(|a| (a.label().to_string(), a.label().to_string())).collect(),
+            Some(spec.agg.label().to_string()),
+            window,
+            cx,
+        );
 
         let set = {
             let entity = entity.clone();
-            move |f: Box<dyn FnOnce(&mut ChartSpec, &[ColumnSchema])>, cx: &mut App| {
+            move |f: Box<dyn FnOnce(&mut ChartSpec)>, cx: &mut App| {
                 let _ = entity.update(cx, |this, cx| {
                     let schema = this.schema();
-                    f(&mut this.spec, &schema);
+                    f(&mut this.spec);
                     fix_spec(&mut this.spec, &schema);
                     cx.emit(WorkspaceEvent::Title);
                     cx.notify();
@@ -937,47 +1133,10 @@ impl Workspace {
             }
         };
         let set = Rc::new(set);
-        let col_options = |kinds: &[ColumnKind]| -> Vec<(SharedString, String)> {
-            schema
-                .iter()
-                .filter(|c| kinds.contains(&c.kind))
-                .map(|c| (SharedString::from(format!("{} ({})", c.label, c.name)), c.name.clone()))
-                .collect()
-        };
-        let label_of = |name: &str| {
-            schema
-                .iter()
-                .find(|c| c.name == name)
-                .map(|c| c.label.clone())
-                .unwrap_or_else(|| name.to_string())
-        };
 
         let mut col = v_flex().gap_3().p_3();
-        // 데이터
-        {
-            let set = set.clone();
-            let ent = entity.clone();
-            col = col.child(field(
-                "데이터",
-                dropdown(
-                    "dataset",
-                    ds_name,
-                    ready,
-                    Some(spec.dataset.clone()),
-                    move |id: String, window, cx| {
-                        let id2 = id.clone();
-                        set(Box::new(move |s, _| s.dataset = id2), cx);
-                        let _ = ent.update(cx, |this, cx| {
-                            let schema = this.schema();
-                            fix_spec(&mut this.spec, &schema);
-                            this.filters.update(cx, |f, cx| f.set_dataset(id.clone(), window, cx));
-                        });
-                    },
-                ),
-                cx,
-            ));
-        }
-        // 차트 종류 (아이콘 대신 짧은 이름 버튼)
+        col = col.child(field("데이터", self.pickers.dataset.element(), cx));
+        // 차트 종류: ToggleGroup처럼 한 개만 켜지는 버튼 묶음
         {
             let mut grid = div().flex().flex_wrap().gap_1();
             for t in CHART_TYPES {
@@ -986,113 +1145,29 @@ impl Workspace {
                     Button::new(SharedString::from(format!("ct-{}", t.name())))
                         .label(t.label())
                         .xsmall()
+                        .selected(t == spec.chart_type)
                         .when(t == spec.chart_type, |b| b.primary())
                         .when(t != spec.chart_type, |b| b.ghost())
-                        .on_click(move |_, _, cx| set(Box::new(move |s, _| s.chart_type = t), cx)),
+                        .on_click(move |_, _, cx| set(Box::new(move |s| s.chart_type = t), cx)),
                 );
             }
             col = col.child(field("차트 종류", grid, cx));
         }
-        // grid
-        {
-            let options: Vec<(SharedString, u32)> = (1..=10).map(|n| (SharedString::from(n.to_string()), n)).collect();
-            let (s1, s2) = (set.clone(), set.clone());
-            let ent = entity.clone();
-            let ent2 = entity.clone();
-            col = col.child(field(
-                "grid (행 × 열)",
-                h_flex()
-                    .gap_1()
-                    .child(dropdown(
-                        "grid-r",
-                        spec.grid.0.to_string(),
-                        options.clone(),
-                        Some(spec.grid.0),
-                        move |n, window, cx| {
-                            s1(Box::new(move |s, _| s.grid.0 = n), cx);
-                            let _ = ent.update(cx, |this, cx| this.apply_grid(window, cx));
-                        },
-                    ))
-                    .child("×")
-                    .child(dropdown(
-                        "grid-c",
-                        spec.grid.1.to_string(),
-                        options,
-                        Some(spec.grid.1),
-                        move |n, window, cx| {
-                            s2(Box::new(move |s, _| s.grid.1 = n), cx);
-                            let _ = ent2.update(cx, |this, cx| this.apply_grid(window, cx));
-                        },
-                    )),
-                cx,
-            ));
+        col = col.child(field("grid (행 × 열)", self.grid_picker(cx), cx));
+        col = col.child(field("x", self.pickers.x.element(), cx));
+        if fields.y.is_some() {
+            col = col.child(field("y", self.pickers.y.element(), cx));
         }
-        // x / y / z
-        {
-            let set_x = set.clone();
-            col = col.child(field(
-                "x",
-                dropdown(
-                    "x",
-                    label_of(&spec.x),
-                    col_options(fields.x),
-                    Some(spec.x.clone()),
-                    move |v, _, cx| set_x(Box::new(move |s, _| s.x = v), cx),
-                ),
-                cx,
-            ));
-            if let Some(kinds) = fields.y {
-                let set_y = set.clone();
-                col = col.child(field(
-                    "y",
-                    dropdown("y", label_of(&spec.y), col_options(kinds), Some(spec.y.clone()), move |v, _, cx| {
-                        set_y(Box::new(move |s, _| s.y = v), cx)
-                    }),
-                    cx,
-                ));
-            }
-            if let Some(kinds) = fields.z {
-                let set_z = set.clone();
-                let z = spec.z.clone().unwrap_or_default();
-                col = col.child(field(
-                    "z (값)",
-                    dropdown("z", label_of(&z), col_options(kinds), Some(z), move |v, _, cx| {
-                        set_z(Box::new(move |s, _| s.z = Some(v)), cx)
-                    }),
-                    cx,
-                ));
-            }
+        if fields.z.is_some() {
+            col = col.child(field("z (값)", self.pickers.z.element(), cx));
         }
         if fields.legend {
-            let mut opts: Vec<(SharedString, Option<String>)> = vec![("없음".into(), None)];
-            opts.extend(
-                schema
-                    .iter()
-                    .filter(|c| c.kind == ColumnKind::Categorical && c.distinct.unwrap_or(99) <= 8)
-                    .map(|c| (SharedString::from(format!("{} ({})", c.label, c.name)), Some(c.name.clone()))),
-            );
-            let cur = spec.legend.as_deref().map(label_of).unwrap_or_else(|| "없음".into());
-            let set_l = set.clone();
-            col = col.child(field(
-                "legend (고유값 8개 이하)",
-                dropdown("legend", cur, opts, Some(spec.legend.clone()), move |v, _, cx| {
-                    set_l(Box::new(move |s, _| s.legend = v), cx)
-                }),
-                cx,
-            ));
+            col = col.child(field("legend (고유값 8개 이하)", self.pickers.legend.element(), cx));
         }
         if fields.agg {
-            let opts: Vec<(SharedString, AggFn)> = AGG_FNS.iter().map(|a| (SharedString::from(a.label()), *a)).collect();
-            let set_a = set.clone();
-            col = col.child(field(
-                "통계 함수",
-                dropdown("agg", spec.agg.label(), opts, Some(spec.agg), move |v, _, cx| {
-                    set_a(Box::new(move |s, _| s.agg = v), cx)
-                }),
-                cx,
-            ));
+            col = col.child(field("통계 함수", self.pickers.agg.element(), cx));
         }
-        // split by · tooltip: 누른 순서대로 쌓이는 다중 선택
+        // split by · tooltip: 누른 순서대로 쌓이는 다중 선택 (고른 순서는 Tag로 보인다)
         for (kind, label) in [("split", "split by (누른 순서)"), ("tooltip", "tooltip 컬럼")] {
             let chosen = if kind == "split" {
                 spec.split_by.clone()
@@ -1117,7 +1192,7 @@ impl Workspace {
                         .on_click(move |_, _, cx| {
                             let name = name.clone();
                             set(
-                                Box::new(move |s, _| {
+                                Box::new(move |s| {
                                     let list = if kind == "split" { &mut s.split_by } else { &mut s.tooltip };
                                     if let Some(p) = list.iter().position(|x| *x == name) {
                                         list.remove(p);
@@ -1130,77 +1205,43 @@ impl Workspace {
                         }),
                 );
             }
-            col = col.child(field(label, chips, cx));
-        }
-        // 공통 속성 (전체 설정): 색 · legend 위치 · 투명도
-        {
-            let mut swatches = h_flex().gap_1();
-            for (i, hex) in PALETTE.iter().enumerate() {
-                let set = set.clone();
-                let c = parse_hex(hex).unwrap();
-                let on = spec.common.color.eq_ignore_ascii_case(hex);
-                swatches = swatches.child(
-                    div()
-                        .id(SharedString::from(format!("sw-{i}")))
-                        .size(px(18.))
-                        .rounded_full()
-                        .bg(hex_color(c))
-                        .border_2()
-                        .border_color(if on { cx.theme().foreground } else { cx.theme().background })
-                        .cursor_pointer()
-                        .on_click(move |_, _, cx| {
-                            let h = hex.to_string();
-                            set(Box::new(move |s, _| s.common.color = h), cx)
-                        }),
-                );
-            }
-            let pos_opts: Vec<(SharedString, LegendPosition)> = vec![
-                ("위".into(), LegendPosition::Top),
-                ("아래".into(), LegendPosition::Bottom),
-                ("왼쪽".into(), LegendPosition::Left),
-                ("오른쪽".into(), LegendPosition::Right),
-            ];
-            let cur_pos = pos_opts
-                .iter()
-                .find(|p| p.1 == spec.common.legend_position)
-                .map(|p| p.0.clone())
-                .unwrap_or_default();
-            let set_p = set.clone();
-            let tr_opts: Vec<(SharedString, u32)> = [0u32, 20, 40, 60]
-                .iter()
-                .map(|t| (SharedString::from(format!("{t}%")), *t))
-                .collect();
-            let set_t = set.clone();
-            col = col.child(field(
-                "공통 속성 (색 · legend 위치 · 투명도)",
-                v_flex().gap_1().child(swatches).child(
-                    h_flex()
-                        .gap_1()
-                        .child(dropdown(
-                            "lpos",
-                            cur_pos,
-                            pos_opts,
-                            Some(spec.common.legend_position),
-                            move |v, _, cx| set_p(Box::new(move |s, _| s.common.legend_position = v), cx),
-                        ))
-                        .child(dropdown(
-                            "transp",
-                            format!("투명도 {:.0}%", spec.common.transparency * 100.0),
-                            tr_opts,
-                            Some((spec.common.transparency * 100.0).round() as u32),
-                            move |v, _, cx| set_t(Box::new(move |s, _| s.common.transparency = v as f32 / 100.0), cx),
-                        )),
-                ),
-                cx,
-            ));
+            let summary = if chosen.is_empty() {
+                None
+            } else {
+                Some(h_flex().gap_1().flex_wrap().children(chosen.iter().enumerate().map(|(i, c)| {
+                    let label = schema
+                        .iter()
+                        .find(|s| &s.name == c)
+                        .map(|s| s.label.clone())
+                        .unwrap_or_else(|| c.clone());
+                    Tag::primary()
+                        .outline()
+                        .small()
+                        .child(if kind == "split" { format!("{} {label}", i + 1) } else { label })
+                })))
+            };
+            col = col.child(field(label, v_flex().gap_1().children(summary).child(chips), cx));
         }
 
+        let ent_settings = entity.clone();
         let ent_draw = entity.clone();
-        let footer = h_flex()
+        let footer = v_flex()
             .gap_2()
             .p_3()
             .border_t_1()
             .border_color(cx.theme().border)
+            .child(
+                Button::new("common-settings")
+                    .label("전체 설정")
+                    .icon(IconName::Settings2)
+                    .outline()
+                    .small()
+                    .w_full()
+                    .disabled(ro)
+                    .on_click(move |_, window, cx| {
+                        let _ = ent_settings.update(cx, |this, cx| this.open_common_settings(window, cx));
+                    }),
+            )
             .child(if running {
                 Button::new("cancel")
                     .label("cancel")
@@ -1234,6 +1275,71 @@ impl Workspace {
             .into_any_element()
     }
 
+    /// grid 크기: Excel의 표 삽입처럼 10 × 10 칸 Popover에서 행 × 열을 고른다 (원본 GridSizePicker)
+    fn grid_picker(&self, cx: &mut Context<Self>) -> AnyElement {
+        let (rows, cols) = self.spec.grid;
+        let entity = cx.entity().downgrade();
+        let hover = self.grid_hover.clone();
+        Popover::new("grid-picker")
+            .trigger(
+                Button::new("grid-trigger")
+                    .label(format!("▦ {rows} × {cols}"))
+                    .small()
+                    .outline()
+                    .w_full(),
+            )
+            .content(move |state, _, cx| {
+                let theme = cx.theme().clone();
+                let (hr, hc) = hover.get();
+                let pop = cx.entity().downgrade();
+                let mut grid = v_flex().gap_0p5();
+                for r in 1..=10u32 {
+                    let mut row = h_flex().gap_0p5();
+                    for c in 1..=10u32 {
+                        let on = r <= hr && c <= hc;
+                        let (hv, pp, ent) = (hover.clone(), pop.clone(), entity.clone());
+                        let (hv2, pp2) = (hover.clone(), pop.clone());
+                        row = row.child(
+                            div()
+                                .id(SharedString::from(format!("g-{r}-{c}")))
+                                .size(px(16.))
+                                .rounded_sm()
+                                .border_1()
+                                .border_color(if on { theme.primary } else { theme.border })
+                                .bg(if on { theme.primary.opacity(0.25) } else { theme.background })
+                                .on_hover(move |inside, _, cx| {
+                                    if *inside {
+                                        hv.set((r, c));
+                                        let _ = pp.update(cx, |_, cx| cx.notify());
+                                    }
+                                })
+                                .on_click(move |_, window, cx| {
+                                    hv2.set((0, 0));
+                                    let _ = pp2.update(cx, |p: &mut PopoverState, cx| p.dismiss(window, cx));
+                                    let _ = ent.update(cx, |this, cx| {
+                                        this.spec.grid = (r, c);
+                                        this.apply_grid(window, cx);
+                                    });
+                                }),
+                        );
+                    }
+                    grid = grid.child(row);
+                }
+                let _ = state;
+                v_flex()
+                    .gap_2()
+                    .p_1()
+                    .child(grid)
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_center()
+                            .child(if hr > 0 { format!("{hr} × {hc}") } else { "행 × 열".into() }),
+                    )
+            })
+            .into_any_element()
+    }
+
     fn apply_grid(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // grid 크기는 바로 반영한다 (item 픽셀 크기가 바뀌므로 보이는 item을 다시 그린다)
         if self.is_running() {
@@ -1253,24 +1359,45 @@ impl Workspace {
 
     fn render_toolbar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let drawn = self.drawn.is_some();
-        let zoomable = self.zoomable();
+        let pan_zoom = drawn && self.zoomable() && !self.read_only;
         let entity = cx.entity().downgrade();
-        let mode_btn = |id: &'static str, label: &'static str, m: Mode, cur: Mode, enabled: bool| {
-            let entity = entity.clone();
-            Button::new(id)
-                .label(label)
-                .xsmall()
-                .when(m == cur, |b| b.primary())
-                .when(m != cur, |b| b.ghost())
-                .disabled(!enabled)
-                .on_click(move |_, _, cx| {
-                    let _ = entity.update(cx, |this, cx| {
-                        this.mode = m;
-                        cx.notify();
-                    });
-                })
-        };
-        let ent_f = entity.clone();
+        // 모드 바: gpui-kit ToggleGroup. 하나만 켜지게 고른 쪽만 남긴다
+        let modes = [
+            (Mode::Default, "기본", true),
+            (Mode::Pan, "이동", pan_zoom),
+            (Mode::Zoom, "확대", pan_zoom),
+        ];
+        let ent_mode = entity.clone();
+        let cur = self.mode;
+        let mut group = ToggleGroup::new("mode-bar").xsmall().segmented();
+        for (m, label, enabled) in modes {
+            group = group.child(
+                Toggle::new(SharedString::from(format!("m-{label}")))
+                    .label(label)
+                    .checked(m == cur)
+                    .disabled(!enabled)
+                    .tooltip(match m {
+                        Mode::Default => "기본: 툴팁 · legend 항목 클릭으로 숨기기",
+                        Mode::Pan => "이동: 끌어서 범위를 옮긴다",
+                        Mode::Zoom => "확대: 끌어서 고른 영역으로 확대",
+                    }),
+            );
+        }
+        let group = group.on_click(move |checked: &Vec<bool>, _, cx| {
+            // 새로 켠 것을 고른다 (이미 켜진 것을 다시 누르면 그대로)
+            let next = checked
+                .iter()
+                .enumerate()
+                .find(|(k, on)| **on && modes[*k].0 != cur)
+                .map(|(k, _)| modes[k].0)
+                .unwrap_or(cur);
+            let _ = ent_mode.update(cx, |this, cx| {
+                this.mode = next;
+                cx.notify();
+            });
+        });
+        let sel = self.selected.filter(|_| drawn);
+        let (e_tbl, e_set, e_f) = (entity.clone(), entity.clone(), entity.clone());
         let filter_count = self.filters.read(cx).active_count();
         h_flex()
             .px_3()
@@ -1278,29 +1405,46 @@ impl Workspace {
             .gap_1()
             .border_b_1()
             .border_color(cx.theme().border)
-            .child(mode_btn("m-default", "기본", Mode::Default, self.mode, true))
-            .child(mode_btn(
-                "m-pan",
-                "이동",
-                Mode::Pan,
-                self.mode,
-                drawn && zoomable && !self.read_only,
-            ))
-            .child(mode_btn(
-                "m-zoom",
-                "확대",
-                Mode::Zoom,
-                self.mode,
-                drawn && zoomable && !self.read_only,
-            ))
+            .child(group)
             .child(div().w(px(1.)).h(px(16.)).mx_2().bg(cx.theme().border))
+            // 차트 도구: 고른 item을 대상으로 한다 (고르기 전에는 막힌다)
+            .child(
+                Button::new("tool-table")
+                    .label("데이터 테이블")
+                    .xsmall()
+                    .ghost()
+                    .disabled(sel.is_none())
+                    .tooltip("고른 item의 원본 행 (item을 눌러 고른다)")
+                    .on_click(move |_, window, cx| {
+                        let _ = e_tbl.update(cx, |this, cx| {
+                            if let Some(i) = this.selected {
+                                this.open_data_table(i, window, cx);
+                            }
+                        });
+                    }),
+            )
+            .child(
+                Button::new("tool-props")
+                    .label("개별 속성")
+                    .xsmall()
+                    .ghost()
+                    .disabled(sel.is_none() || self.read_only)
+                    .tooltip("고른 item의 색 · legend 색 · legend 위치")
+                    .on_click(move |_, window, cx| {
+                        let _ = e_set.update(cx, |this, cx| {
+                            if let Some(i) = this.selected {
+                                this.open_item_settings(i, window, cx);
+                            }
+                        });
+                    }),
+            )
+            .child(div().flex_1())
             .child(
                 div()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child("legend 항목 클릭: 숨기기 · 더블 클릭: 크게 보기 · 휠: 페이지"),
+                    .child("우클릭: item 메뉴 · 더블 클릭: 크게 보기 · 휠: 페이지"),
             )
-            .child(div().flex_1())
             .child(
                 Button::new("toggle-filters")
                     .label(if filter_count > 0 {
@@ -1312,7 +1456,7 @@ impl Workspace {
                     .when(self.show_filters, |b| b.primary())
                     .when(!self.show_filters, |b| b.outline())
                     .on_click(move |_, _, cx| {
-                        let _ = ent_f.update(cx, |this, cx| {
+                        let _ = e_f.update(cx, |this, cx| {
                             this.show_filters = !this.show_filters;
                             cx.notify();
                         });
@@ -1329,10 +1473,9 @@ impl Workspace {
         let selected = self.selected == Some(i);
         let img = d.images.get(&i);
         let pending = d.pending.contains(&i);
-        let failed = d.main.progress.is_finished() && img.is_none() && !pending && d.main.progress.stage() == JobStage::Done && false;
-        let _ = failed;
         let (e1, e2, e3) = (entity.clone(), entity.clone(), entity.clone());
         let has_view = d.states.lock().get(i).is_some_and(|s| s.view.is_some());
+        let has_hidden = d.states.lock().get(i).is_some_and(|s| !s.hidden_legend.is_empty());
         let mut cell = div()
             .id(SharedString::from(format!("item-{i}")))
             .relative()
@@ -1359,6 +1502,29 @@ impl Workspace {
             .on_mouse_up(MouseButton::Left, move |e, window, cx| {
                 let _ = e3.update(cx, |this, cx| this.on_up(false, e, window, cx));
             })
+            .on_hover({
+                let ent = entity.clone();
+                move |inside, _, cx| {
+                    if !*inside {
+                        let _ = ent.update(cx, |this, cx| {
+                            if this.hover.as_ref().is_some_and(|h| h.item == i) {
+                                this.hover = None;
+                                cx.notify();
+                            }
+                        });
+                    }
+                }
+            })
+            .on_mouse_down(MouseButton::Right, {
+                let ent = entity.clone();
+                move |_, _, cx| {
+                    let _ = ent.update(cx, |this, cx| {
+                        this.hover = None;
+                        this.selected = Some(i);
+                        cx.notify();
+                    });
+                }
+            })
             .child(
                 canvas(
                     move |b, _, _| {
@@ -1383,21 +1549,29 @@ impl Workspace {
                 }
             }
             None => {
+                // 올 차트 모양대로 자리 표시 (원본 Skeleton): 제목 줄 + 그림 영역
                 let name = d.data.as_ref().map(|data| data.item_name(i)).unwrap_or_default();
                 cell = cell.child(
                     v_flex()
                         .absolute()
                         .size_full()
-                        .items_center()
-                        .justify_center()
+                        .p_3()
                         .gap_2()
-                        .child(div().text_xs().text_color(theme.muted_foreground).child(name))
-                        .child(Progress::new(SharedString::from(format!("p-{i}"))).loading(true).w(px(120.))),
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .child(div().text_xs().text_color(theme.muted_foreground).child(name))
+                                .child(div().flex_1())
+                                .child(Skeleton::new().w(px(56.)).h(px(10.)).rounded_sm()),
+                        )
+                        .child(Skeleton::new().w(px(140.)).h(px(10.)).rounded_sm())
+                        .child(Skeleton::new().flex_1().w_full().rounded_md()),
                 );
             }
         }
-        // item 툴바: 축소 · 확대 초기화 · 크게 보기 (커서를 올리면 보인다)
-        let (z1, z2, z3) = (entity.clone(), entity.clone(), entity);
+        // item 툴바: 축소 · 확대 초기화 · 개별 속성 · 크게 보기 (커서를 올리면 보인다)
+        let (z1, z2, z3, z4) = (entity.clone(), entity.clone(), entity.clone(), entity.clone());
+        let ro = self.read_only;
         let zoomable = d.spec.chart_type.fields().zoom && !self.read_only;
         cell = cell.child(
             h_flex()
@@ -1430,6 +1604,18 @@ impl Workspace {
                             }),
                     )
                 })
+                .when(!ro, |t| {
+                    t.child(
+                        Button::new(SharedString::from(format!("st-{i}")))
+                            .icon(IconName::Settings)
+                            .xsmall()
+                            .ghost()
+                            .tooltip("개별 속성")
+                            .on_click(move |_, window, cx| {
+                                let _ = z4.update(cx, |this, cx| this.open_item_settings(i, window, cx));
+                            }),
+                    )
+                })
                 .child(
                     Button::new(SharedString::from(format!("en-{i}")))
                         .icon(IconName::Maximize)
@@ -1442,7 +1628,40 @@ impl Workspace {
                 ),
         );
         cell = self.overlays(cell, i, false, cx);
-        cell.into_any_element()
+        // 우클릭 메뉴 (원본 Base UI ContextMenu → gpui-kit ContextMenu)
+        let ent = entity;
+        cell.context_menu(move |menu, _, _| {
+            let item = |label: &'static str, f: fn(&mut Workspace, usize, &mut Window, &mut Context<Workspace>)| {
+                let ent = ent.clone();
+                PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                    let _ = ent.update(cx, |this, cx| {
+                        this.selected = Some(i);
+                        f(this, i, window, cx)
+                    });
+                })
+            };
+            menu.item(item("크게 보기", |this, i, window, cx| this.enlarge(Some(i), window, cx)))
+                .item(item("데이터 테이블", |this, i, window, cx| {
+                    this.open_data_table(i, window, cx)
+                }))
+                .separator()
+                .item(item("축소", |this, i, window, cx| this.zoom_out(i, window, cx)).disabled(!zoomable))
+                .item(
+                    item("확대 초기화", |this, i, window, cx| {
+                        this.update_state(i, window, cx, |s| s.view = None)
+                    })
+                    .disabled(!has_view || ro),
+                )
+                .item(
+                    item("숨긴 legend 모두 보이기", |this, i, window, cx| {
+                        this.update_state(i, window, cx, |s| s.hidden_legend.clear())
+                    })
+                    .disabled(!has_hidden || ro),
+                )
+                .separator()
+                .item(item("개별 속성…", |this, i, window, cx| this.open_item_settings(i, window, cx)).disabled(ro))
+        })
+        .into_any_element()
     }
 
     /// 툴팁 · 드래그 영역 · 가까운 점 표시
@@ -1553,15 +1772,20 @@ impl Workspace {
                 .relative()
                 .items_center()
                 .justify_center()
-                .gap_2()
                 .child(measure)
-                .child(div().text_lg().child("왼쪽에서 설정을 고르고 draw를 누르세요."))
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(theme.muted_foreground)
-                        .child("split by로 나눈 조합마다 차트 한 장(item)을 그립니다."),
-                )
+                .child(empty_state(
+                    IconName::ChartPie,
+                    if self.dataset().is_some() {
+                        "왼쪽에서 설정을 고르고 draw를 누르세요."
+                    } else {
+                        "쓸 수 있는 데이터가 없습니다."
+                    },
+                    if self.dataset().is_some() {
+                        "split by로 나눈 조합마다 차트 한 장(item)을 그립니다."
+                    } else {
+                        "상단 datastore에서 샘플을 등록하거나 CSV를 올리세요."
+                    },
+                ))
                 .into_any_element();
         };
         if let Some(e) = d.main.progress.error.lock().clone() {
@@ -1571,7 +1795,7 @@ impl Workspace {
                 .items_center()
                 .justify_center()
                 .child(measure)
-                .child(div().text_color(theme.danger).child(format!("그릴 수 없습니다: {e}")))
+                .child(empty_state(IconName::TriangleAlert, "그릴 수 없습니다", &e))
                 .into_any_element();
         }
         if let Some(i) = self.enlarged {
@@ -1799,23 +2023,12 @@ impl Workspace {
             .into_any_element()
     }
 
+    /// 하단 job 바 (gpui-kit StatusBar): 왼쪽 단계·진행률·상태별 수, 가운데 경과·속도, 오른쪽 쿼리·스레드·이미지
     fn render_job_bar(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
-        let mut bar = h_flex()
-            .h(px(34.))
-            .px_3()
-            .gap_3()
-            .border_t_1()
-            .border_color(theme.border)
-            .bg(theme.status_bar)
-            .text_xs();
         let Some(d) = &self.drawn else {
-            return bar
-                .child(
-                    div()
-                        .text_color(theme.muted_foreground)
-                        .child(format!("렌더 스레드 {}개 대기", job::default_workers())),
-                )
+            return StatusBar::new()
+                .left(format!("렌더 스레드 {}개 대기", job::default_workers()))
                 .into_any_element();
         };
         let p = &d.main.progress;
@@ -1827,12 +2040,12 @@ impl Workspace {
         let stage = p.stage();
         let ratio = if total > 0 { done as f32 / total as f32 } else { 0.0 };
         let rate = if elapsed > 0.0 { done as f64 / elapsed } else { 0.0 };
-        let stage_label = match stage {
-            JobStage::Query => "쿼리 중",
-            JobStage::Render => "렌더링 중",
-            JobStage::Done => "완료",
-            JobStage::Failed => "실패",
-            JobStage::Cancelled => "취소됨",
+        let (stage_label, stage_tag) = match stage {
+            JobStage::Query => ("쿼리 중", Tag::info()),
+            JobStage::Render => ("렌더링 중", Tag::info()),
+            JobStage::Done => ("완료", Tag::success()),
+            JobStage::Failed => ("실패", Tag::danger()),
+            JobStage::Cancelled => ("취소됨", Tag::warning()),
         };
         let remaining = if rate > 0.0 && done < total && stage == JobStage::Render {
             format!(" · 남은 시간 약 {}", fmt_ms((total - done) as f64 / rate * 1000.0))
@@ -1844,36 +2057,52 @@ impl Workspace {
         } else {
             0.0
         };
-        bar = bar
-            .child(div().font_weight(FontWeight::SEMIBOLD).child(stage_label))
-            .child(
+        let mut counts = format!("✓ {} / {}", fmt_int(done - failed.min(done)), fmt_int(total));
+        if running > 0 {
+            counts.push_str(&format!(" · ◐ {running}"));
+        }
+        if failed > 0 {
+            counts.push_str(&format!(" · ✕ {failed}"));
+        }
+        if stage == JobStage::Cancelled {
+            counts.push_str(&format!(" · 취소 {}", fmt_int(total - done)));
+        }
+        StatusBar::new()
+            .left(stage_tag.small().child(stage_label))
+            .left(
                 Progress::new("job-progress")
                     .value(ratio * 100.0)
                     .loading(stage == JobStage::Query)
                     .w(px(160.)),
             )
-            .child(format!("{:.0}%", ratio * 100.0))
-            .child(format!("✓ {} / {}", fmt_int(done - failed.min(done)), fmt_int(total)))
-            .when(running > 0, |b| b.child(format!("◐ {running}")))
-            .when(failed > 0, |b| b.child(format!("✕ {failed}")))
-            .when(stage == JobStage::Cancelled, |b| b.child(format!("취소 {}", fmt_int(total - done))))
+            .left(format!("{:.0}%", ratio * 100.0))
+            .left(counts)
             .child(format!(
                 "{} · {} item/s{}",
                 fmt_ms(elapsed * 1000.0),
                 fmt_int(rate.round() as usize),
                 remaining
             ))
-            .child(div().flex_1())
-            .child(div().text_color(theme.muted_foreground).child(format!(
+            .right(div().text_color(theme.muted_foreground).child(format!(
                 "쿼리 {} · item 평균 {} · 렌더 스레드 {} · 화면 이미지 {}개 {}",
                 p.query_ms.lock().map(fmt_ms).unwrap_or("-".into()),
                 fmt_ms(avg_item),
                 p.workers,
                 d.images.len(),
                 crate::ui::fmt_bytes(d.image_bytes),
-            )));
-        bar.into_any_element()
+            )))
+            .into_any_element()
     }
+}
+
+/// 비어 있는 영역: 아이콘 · 제목 · 설명으로 다음 할 일을 알린다 (gpui-kit Empty)
+fn empty_state(icon: IconName, title: &str, desc: &str) -> Empty {
+    Empty::new().header(
+        EmptyHeader::new()
+            .media(EmptyMedia::new().with_variant(EmptyMediaVariant::Icon).child(Icon::new(icon)))
+            .title(EmptyTitle::new().child(title.to_string()))
+            .description(EmptyDescription::new().child(desc.to_string())),
+    )
 }
 
 fn img_el(image: Arc<RenderImage>) -> Img {

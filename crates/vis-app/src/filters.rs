@@ -4,10 +4,12 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
+use gpui_kit::component::accordion::Accordion;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::{ActiveTheme as _, IconName, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
+use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -15,7 +17,9 @@ use vis_core::dataset::ColumnKind;
 use vis_core::query::summary::{ColumnSummary, column_summary};
 use vis_core::spec::Filter;
 use vis_core::store::Store;
-use vis_core::timefmt::{KST_OFFSET_MS, format_kst, parse_datetime};
+use vis_core::timefmt::format_kst;
+
+const SLIDER_STEPS: u32 = 1000;
 
 enum Edit {
     Range {
@@ -34,7 +38,8 @@ pub struct FilterPanel {
     open: HashSet<String>,
     summaries: HashMap<String, ColumnSummary>,
     edits: BTreeMap<String, Edit>,
-    range_inputs: HashMap<String, (Entity<InputState>, Entity<InputState>)>,
+    /// 범위 Slider (0..=SLIDER_STEPS로 정규화. 시계열 epoch ms는 f32로 담으면 2분 단위로 뭉개진다)
+    sliders: HashMap<String, Entity<SliderState>>,
     search: HashMap<String, Entity<InputState>>,
     /// draw 전에 받은 필터 (history 복원)
     preset: Vec<Filter>,
@@ -49,7 +54,7 @@ impl FilterPanel {
             open: HashSet::new(),
             summaries: HashMap::new(),
             edits: BTreeMap::new(),
-            range_inputs: HashMap::new(),
+            sliders: HashMap::new(),
             search: HashMap::new(),
             preset: vec![],
             _subs: vec![],
@@ -62,7 +67,7 @@ impl FilterPanel {
             self.open.clear();
             self.summaries.clear();
             self.edits.clear();
-            self.range_inputs.clear();
+            self.sliders.clear();
             self.search.clear();
             self.preset.clear();
             cx.notify();
@@ -142,103 +147,81 @@ impl FilterPanel {
         self.filters().len()
     }
 
-    fn toggle(&mut self, col: String, kind: ColumnKind, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.open.remove(&col) {
-            self.open.insert(col.clone());
-            // 열 때 요약을 읽는다 (원본은 서버 호출, 여기서는 열 배열을 바로 훑는다)
-            if !self.summaries.contains_key(&col) {
-                if let Some(ds) = self.store.get(&self.dataset) {
-                    if let Ok(s) = column_summary(&ds, &col) {
-                        if let ColumnSummary::Range { min, max, .. } = &s {
-                            let e = self.edits.entry(col.clone()).or_insert(Edit::Range {
-                                min: *min,
-                                max: *max,
-                                inverse: false,
-                                include_null: true,
-                                full: (*min, *max),
-                            });
-                            if let Edit::Range { full, .. } = e {
-                                *full = (*min, *max);
-                            }
-                        }
-                        self.summaries.insert(col.clone(), s);
-                    }
-                }
-            }
-            match kind {
-                ColumnKind::Categorical => {
-                    if !self.search.contains_key(&col) {
-                        let input = cx.new(|cx| InputState::new(window, cx).placeholder("검색"));
-                        self._subs.push(cx.subscribe(&input, |_, _, e: &InputEvent, cx| {
-                            if matches!(e, InputEvent::Change) {
-                                cx.notify();
-                            }
-                        }));
-                        self.search.insert(col.clone(), input);
-                    }
-                }
-                _ => {
-                    if !self.range_inputs.contains_key(&col) {
-                        let time = kind == ColumnKind::Datetime;
-                        let (lo, hi) = match self.edits.get(&col) {
-                            Some(Edit::Range { min, max, .. }) => (*min, *max),
-                            _ => (0.0, 0.0),
-                        };
-                        let fmt = move |v: f64| if time { format_kst(v, "%Y-%m-%d %H:%M:%S") } else { format!("{v}") };
-                        let a = cx.new(|cx| InputState::new(window, cx).default_value(fmt(lo)));
-                        let b = cx.new(|cx| InputState::new(window, cx).default_value(fmt(hi)));
-                        for (k, input) in [(0, a.clone()), (1, b.clone())] {
-                            let col = col.clone();
-                            self._subs.push(cx.subscribe(&input, move |this, state, e: &InputEvent, cx| {
-                                if !matches!(e, InputEvent::Change | InputEvent::Blur | InputEvent::PressEnter { .. }) {
-                                    return;
-                                }
-                                let text = state.read(cx).value().to_string();
-                                let v = if time {
-                                    parse_datetime(&text).map(|t| t - KST_OFFSET_MS)
-                                } else {
-                                    text.trim().parse::<f64>().ok()
-                                };
-                                if let (Some(v), Some(Edit::Range { min, max, .. })) = (v, this.edits.get_mut(&col)) {
-                                    if k == 0 {
-                                        *min = v;
-                                    } else {
-                                        *max = v;
-                                    }
-                                    cx.notify();
-                                }
-                            }));
-                        }
-                        self.range_inputs.insert(col.clone(), (a, b));
-                    }
-                }
+    /// Accordion에서 열린 컬럼이 바뀜
+    fn set_open(&mut self, open: HashSet<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let schema = self.store.get(&self.dataset).map(|d| d.schema()).unwrap_or_default();
+        for col in open.difference(&self.open.clone()) {
+            if let Some(c) = schema.iter().find(|c| &c.name == col) {
+                self.prepare(col.clone(), c.kind, window, cx);
             }
         }
+        self.open = open;
         cx.notify();
     }
 
-    fn render_column(&self, name: &str, label: &str, kind: ColumnKind, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme().clone();
-        let open = self.open.contains(name);
-        let active = self.filters().iter().any(|f| f.column() == name);
-        let col = name.to_string();
-        let header = h_flex()
-            .id(SharedString::from(format!("fh-{name}")))
-            .px_2()
-            .py_1p5()
-            .gap_2()
-            .cursor_pointer()
-            .hover(|s| s.bg(theme.list_hover))
-            .on_click(cx.listener(move |this, _, window, cx| this.toggle(col.clone(), kind, window, cx)))
-            .child(gpui_kit::component::Icon::new(if open { IconName::ChevronDown } else { IconName::ChevronRight }).xsmall())
-            .child(div().flex_1().text_sm().child(format!("{label}")))
-            .child(div().text_xs().text_color(theme.muted_foreground).child(kind.label()))
-            .when(active, |h| h.child(div().size(px(7.)).rounded_full().bg(theme.primary)));
-        let mut block = v_flex().border_b_1().border_color(theme.border).child(header);
-        if open {
-            block = block.child(self.render_body(name, kind, cx));
+    /// 열 때 그 컬럼 요약을 읽고 입력 상태를 만든다 (원본은 서버 호출, 여기서는 열 배열을 바로 훑는다)
+    fn prepare(&mut self, col: String, kind: ColumnKind, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.summaries.contains_key(&col) {
+            if let Some(ds) = self.store.get(&self.dataset) {
+                if let Ok(s) = column_summary(&ds, &col) {
+                    if let ColumnSummary::Range { min, max, .. } = &s {
+                        let e = self.edits.entry(col.clone()).or_insert(Edit::Range {
+                            min: *min,
+                            max: *max,
+                            inverse: false,
+                            include_null: true,
+                            full: (*min, *max),
+                        });
+                        if let Edit::Range { full, .. } = e {
+                            *full = (*min, *max);
+                        }
+                    }
+                    self.summaries.insert(col.clone(), s);
+                }
+            }
         }
-        block.into_any_element()
+        match kind {
+            ColumnKind::Categorical => {
+                if !self.search.contains_key(&col) {
+                    let input = cx.new(|cx| InputState::new(window, cx).placeholder("검색"));
+                    self._subs.push(cx.subscribe(&input, |_, _, e: &InputEvent, cx| {
+                        if matches!(e, InputEvent::Change) {
+                            cx.notify();
+                        }
+                    }));
+                    self.search.insert(col.clone(), input);
+                }
+            }
+            _ => {
+                if !self.sliders.contains_key(&col) {
+                    let Some(Edit::Range { min, max, full, .. }) = self.edits.get(&col) else {
+                        return;
+                    };
+                    let to_t = |v: f64| {
+                        if full.1 > full.0 {
+                            ((v - full.0) / (full.1 - full.0) * SLIDER_STEPS as f64) as f32
+                        } else {
+                            0.0
+                        }
+                    };
+                    let (a, b) = (to_t(*min), to_t(*max));
+                    let slider = cx.new(|_| SliderState::new().min(0.0).max(SLIDER_STEPS as f32).step(1.0).default_value(a..b));
+                    let c = col.clone();
+                    self._subs.push(cx.subscribe(&slider, move |this, _, e: &SliderEvent, cx| {
+                        if let SliderEvent::Change(v) = e {
+                            if let Some(Edit::Range { min, max, full, .. }) = this.edits.get_mut(&c) {
+                                let at = |t: f32| full.0 + (full.1 - full.0) * (t as f64 / SLIDER_STEPS as f64);
+                                // 끝까지 끌면 정확히 전체 범위 (반올림 오차로 끝 행이 빠지지 않게)
+                                *min = if v.start() <= 0.0 { full.0 } else { at(v.start()) };
+                                *max = if v.end() >= SLIDER_STEPS as f32 { full.1 } else { at(v.end()) };
+                            }
+                            cx.notify();
+                        }
+                    }));
+                    self.sliders.insert(col, slider);
+                }
+            }
+        }
     }
 
     fn render_body(&self, name: &str, kind: ColumnKind, cx: &mut Context<Self>) -> AnyElement {
@@ -248,7 +231,16 @@ impl FilterPanel {
         };
         match summary {
             ColumnSummary::Range { min, max, nulls } => {
-                let (Some((a, b)), Some(Edit::Range { inverse, include_null, .. })) = (self.range_inputs.get(name), self.edits.get(name))
+                let (
+                    Some(slider),
+                    Some(Edit::Range {
+                        inverse,
+                        include_null,
+                        min: lo,
+                        max: hi,
+                        ..
+                    }),
+                ) = (self.sliders.get(name), self.edits.get(name))
                 else {
                     return div().into_any_element();
                 };
@@ -262,7 +254,6 @@ impl FilterPanel {
                 };
                 let (c1, c2, c3) = (name.to_string(), name.to_string(), name.to_string());
                 v_flex()
-                    .p_2()
                     .gap_1p5()
                     .child(div().text_xs().text_color(theme.muted_foreground).child(format!(
                         "전체 {} ~ {} · 값 없음 {}",
@@ -270,8 +261,14 @@ impl FilterPanel {
                         fmt(*max),
                         nulls
                     )))
-                    .child(Input::new(a).small())
-                    .child(Input::new(b).small())
+                    .child(Slider::new(slider).w_full())
+                    .child(
+                        h_flex()
+                            .justify_between()
+                            .text_xs()
+                            .child(div().child(fmt(*lo)))
+                            .child(div().child(fmt(*hi))),
+                    )
                     .child(
                         Checkbox::new(SharedString::from(format!("inv-{name}")))
                             .label("범위 반전 (범위 밖만)")
@@ -309,12 +306,9 @@ impl FilterPanel {
                                 }) = this.edits.get_mut(&c3)
                                 {
                                     (*min, *max, *inverse, *include_null) = (full.0, full.1, false, true);
-                                    let (lo, hi) = *full;
-                                    if let Some((a, b)) = this.range_inputs.get(&c3).cloned() {
-                                        let fmtv = |v: f64| if time { format_kst(v, "%Y-%m-%d %H:%M:%S") } else { format!("{v}") };
-                                        a.update(cx, |s, cx| s.set_value(fmtv(lo), window, cx));
-                                        b.update(cx, |s, cx| s.set_value(fmtv(hi), window, cx));
-                                    }
+                                }
+                                if let Some(sl) = this.sliders.get(&c3).cloned() {
+                                    sl.update(cx, |s, cx| s.set_value(0.0..SLIDER_STEPS as f32, window, cx));
                                 }
                                 cx.notify();
                             })),
@@ -440,9 +434,36 @@ impl Render for FilterPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let schema = self.store.get(&self.dataset).map(|d| d.schema()).unwrap_or_default();
-        let mut list = v_flex();
+        // 컬럼마다 아코디언 (여러 개 열 수 있다). 여는 순간 그 컬럼 요약을 읽는다
+        let names: Vec<String> = schema.iter().map(|c| c.name.clone()).collect();
+        let active: Vec<String> = self.filters().iter().map(|f| f.column().to_string()).collect();
+        let ent = cx.entity().downgrade();
+        let mut list =
+            Accordion::new("filter-columns")
+                .multiple(true)
+                .small()
+                .h_auto()
+                .on_toggle_click(move |open: &[usize], window, cx| {
+                    let set: HashSet<String> = open.iter().filter_map(|&i| names.get(i).cloned()).collect();
+                    let _ = ent.update(cx, |this, cx| this.set_open(set, window, cx));
+                });
         for c in &schema {
-            list = list.child(self.render_column(&c.name, &c.label, c.kind, cx));
+            let open = self.open.contains(&c.name);
+            let body = open.then(|| self.render_body(&c.name, c.kind, cx));
+            let on = active.contains(&c.name);
+            let title = h_flex()
+                .w_full()
+                .gap_2()
+                .child(div().flex_1().child(c.label.clone()))
+                .child(div().text_xs().text_color(theme.muted_foreground).child(c.kind.label()))
+                .when(on, |h| h.child(div().size(px(7.)).rounded_full().bg(theme.primary)));
+            list = list.item(move |item| {
+                let item = item.open(open).title(title);
+                match body {
+                    Some(b) => item.child(b),
+                    None => item,
+                }
+            });
         }
         let n = self.active_count();
         v_flex()
@@ -462,6 +483,6 @@ impl Render for FilterPanel {
                     .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(format!("필터 {n}")))
                     .child(div().text_xs().text_color(theme.muted_foreground).child("draw할 때 적용됩니다.")),
             )
-            .child(div().id("filter-scroll").flex_1().overflow_y_scroll().child(list))
+            .child(div().id("filter-scroll").flex_1().overflow_y_scroll().p_1().child(list))
     }
 }

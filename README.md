@@ -63,14 +63,40 @@
 | 확대·이동 | 확대 모드 드래그, 이동 모드 드래그, 축소, 확대 초기화 (item마다) |
 | legend | 범주 컬럼(고유값 8개 이하)으로 색 나누기, PNG의 legend 항목을 눌러 item별로 값 숨기기 |
 | 필터 | 컬럼별 아코디언: 숫자·시계열 범위 + 반전 + null, 범주 검색 + 가상 목록 체크. draw할 때 적용 |
-| 공통 속성 | 색, legend 위치(위·아래·왼쪽·오른쪽), 투명도 |
+| 공통 속성 · 개별 속성 | 전체 설정: 색, legend 값별 색, legend 위치, 투명도 (item 개별 속성을 덮어씀). item ⚙: 그 item의 색·legend 색·legend 위치, 공통 따르기 |
+| 데이터 테이블 | 고른 item의 원본 행(split 조합 + draw 필터 + 숨긴 legend 제외), 열 정렬 |
+| 우클릭 메뉴 | 크게 보기 · 데이터 테이블 · 축소 · 확대 초기화 · 숨긴 legend 모두 보이기 · 개별 속성 |
 | 화면 크기 | 크기 변경이 멈추고 300ms 뒤 보이는 item만 다시 그림(그동안 이전 이미지를 늘려 보임) |
 | 크게 보기 | 더블 클릭 / ⤢ 버튼, `<< < > >>`로 item 이동 |
 | history | draw마다 1건(섬네일), item 상태(확대·숨긴 legend) 덧붙임, 다시 보기 전용 탭, gallery에서 편집 |
 | 탭 | gallery 탭 여러 개, 탭마다 작업 상태 |
 | 벤치마크 화면 | 원본 `pnpm bench:db`와 같은 케이스를 이 PC에서 재고 웹 기준값과 배율 표시 |
 
-범위 밖(원본에는 있음): 로그인·JWT(데스크톱 단일 사용자라 뺌), 공유 링크, 도형(사각형·선·텍스트) 그리기, 영역 선택·즐겨찾기·새 범례·점 삭제, 하위 차트(stack·donut·ECDF …), 차트 속성 세부 설정(축·글꼴·analytics 구역 …), 데이터 표·엑셀 다운로드, 다국어.
+### 원본 UI → gpui-kit 컴포넌트
+
+원본(Base UI · 네이티브 popover · 직접 만든 조각)에서 쓰던 화면 요소를 gpui-kit 기본 컴포넌트로 옮겼습니다.
+
+| 원본 화면 요소 | gpui-kit |
+|---|---|
+| 데이터 · x · y · z · legend · 통계 함수 Select (Base UI Select) | `Select` (+ `SearchableVec`, 컬럼 목록은 검색 가능) |
+| grid 크기 10 × 10 칸 고르기 (popover) | `Popover` 안의 칸 격자 |
+| 전체 설정 팝업 · item ⚙ 개별 속성 팝업 (overlay-kit Dialog) | `Dialog` + `ColorPicker` (색 · legend 값별 색) + `RadioGroup` (legend 위치) + `Slider` (투명도) |
+| item 우클릭 메뉴 (Base UI ContextMenu) | `ContextMenu` (`ContextMenuExt`) + `PopupMenuItem` |
+| 필터 패널 컬럼별 아코디언 · 범위 슬라이더 (Base UI Slider) | `Accordion` (여러 개 열기) + 범위 `Slider` + `Checkbox` + `Input` (검색) |
+| 삭제 확인 (AlertDialog) | `AlertDialog` (위험 동작 버튼) |
+| datastore 데이터 목록 표 | `Table` |
+| 데이터 테이블 (가상 스크롤 · 열 머리 정렬) | `DataTable` + `TableDelegate` |
+| 모드 바 (기본 · 이동 · 확대) | `ToggleGroup` / `Toggle` |
+| 하단 job 바 | `StatusBar` + `Progress` + `Tag` (단계) |
+| 고른 split 순서 표시 | `Tag` |
+| 빈 화면 안내 (EmptyState) · 받는 중 자리 표시 (Skeleton) | `Empty` · `Skeleton` |
+| gallery 탭 · 알림 · 툴팁 · 버튼 | `TabBar`/`Tab` · `Notification` · `Tooltip` · `Button` |
+
+직접 그린 채로 둔 것: 차트 PNG 위의 툴팁·가까운 점 표시·확대 드래그 영역(차트 metadata 좌표에 맞춰 그려야 함), 오른쪽 페이지 막대(원본도 직접 그린 Windows식 페이지 스크롤바), 필터의 범주 값 목록(수천 개라 GPUI `uniform_list`로 가상화).
+
+![settings](docs/screenshots/settings.png)
+
+범위 밖(원본에는 있음): 로그인·JWT(데스크톱 단일 사용자라 뺌), 공유 링크, 도형(사각형·선·텍스트) 그리기, 영역 선택·즐겨찾기·새 범례·점 삭제, 하위 차트(stack·donut·ECDF …), 차트 속성 세부 설정(축·글꼴·analytics 구역 …), 전체 데이터 표(샘플)·CSV/엑셀 다운로드, 다국어.
 
 ## 실행
 
@@ -109,6 +135,10 @@ GPUI의 Windows 백엔드(DirectX 11)는 release 빌드에서 HLSL 셰이더를 
 | datastore | history | 벤치마크 |
 |---|---|---|
 | ![](docs/screenshots/datastore.png) | ![](docs/screenshots/history.png) | ![](docs/screenshots/bench.png) |
+
+| 데이터 테이블 | 우클릭 메뉴 |
+|---|---|
+| ![](docs/screenshots/data-table.png) | ![](docs/screenshots/context-menu.png) |
 
 차트 14종 (`vis-bench --samples`):
 

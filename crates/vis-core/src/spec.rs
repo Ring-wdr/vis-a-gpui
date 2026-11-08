@@ -192,6 +192,9 @@ pub struct CommonProps {
     pub legend_position: LegendPosition,
     /// 0이면 불투명
     pub transparency: f32,
+    /// legend 값별 색 (없으면 팔레트 순서)
+    #[serde(default)]
+    pub legend_colors: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for CommonProps {
@@ -200,6 +203,7 @@ impl Default for CommonProps {
             color: crate::render::theme::PALETTE[0].to_string(),
             legend_position: LegendPosition::Top,
             transparency: 0.0,
+            legend_colors: Default::default(),
         }
     }
 }
@@ -250,6 +254,13 @@ pub struct ItemView {
 pub struct ItemState {
     pub view: Option<ItemView>,
     pub hidden_legend: Vec<String>,
+    /// item 개별 속성: 색 · legend 값별 색 · legend 위치. 공통 속성보다 우선한다
+    #[serde(default)]
+    pub color: Option<String>,
+    #[serde(default)]
+    pub legend_colors: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub legend_position: Option<LegendPosition>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]

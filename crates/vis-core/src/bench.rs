@@ -297,6 +297,7 @@ pub fn run_draw(ds: &Arc<Dataset>, spec: &ChartSpec, workers: usize, size: (f32,
         states: Arc::new(|_| ItemState::default()),
         only: None,
         opts: RenderOptions {
+            common: None,
             width: size.0,
             height: size.1,
             scale: 1.0,

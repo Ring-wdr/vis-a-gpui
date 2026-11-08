@@ -114,6 +114,7 @@ fn render_samples(ds: &std::sync::Arc<vis_core::dataset::Dataset>, dir: &str) {
     sankey.agg = AggFn::Count;
     specs.push(sankey);
     let opts = RenderOptions {
+        common: None,
         width: 520.0,
         height: 360.0,
         scale: 2.0,
