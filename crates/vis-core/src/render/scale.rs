@@ -8,6 +8,8 @@ pub struct Linear {
     pub d1: f64,
     pub r0: f64,
     pub r1: f64,
+    /// 로그 축 (도메인이 양수일 때만)
+    pub log: bool,
 }
 
 impl Linear {
@@ -17,22 +19,54 @@ impl Linear {
             d1: domain.1,
             r0: range.0,
             r1: range.1,
+            log: false,
+        }
+    }
+    /// 로그 축으로. 도메인에 0 이하가 있으면 그대로 선형
+    pub fn with_log(mut self, on: bool) -> Self {
+        self.log = on && self.d0 > 0.0 && self.d1 > 0.0;
+        self
+    }
+    /// 같은 도메인·로그 설정에 새 범위
+    pub fn with_range(self, range: (f64, f64)) -> Self {
+        Self {
+            r0: range.0,
+            r1: range.1,
+            ..self
         }
     }
     #[inline]
+    fn fwd(&self, v: f64) -> f64 {
+        if self.log { v.max(1e-300).log10() } else { v }
+    }
+    #[inline]
     pub fn map(&self, v: f64) -> f64 {
-        let span = self.d1 - self.d0;
-        let t = if span != 0.0 { (v - self.d0) / span } else { 0.5 };
+        let (a, b) = (self.fwd(self.d0), self.fwd(self.d1));
+        let span = b - a;
+        let t = if span != 0.0 { (self.fwd(v) - a) / span } else { 0.5 };
         self.r0 * (1.0 - t) + self.r1 * t
     }
     #[inline]
     pub fn invert(&self, p: f64) -> f64 {
         let span = self.r1 - self.r0;
         let t = if span != 0.0 { (p - self.r0) / span } else { 0.5 };
+        if self.log {
+            let (a, b) = (self.d0.log10(), self.d1.log10());
+            return 10f64.powf(a + (b - a) * t);
+        }
         self.d0 + (self.d1 - self.d0) * t
     }
-    /// d3 linear.nice(count)
+    /// d3 linear.nice(count). 로그 축이면 10의 거듭제곱으로
     pub fn nice(mut self, count: usize) -> Self {
+        if self.log {
+            let (lo, hi) = (self.d0.min(self.d1), self.d0.max(self.d1));
+            self.d0 = 10f64.powf(lo.log10().floor());
+            self.d1 = 10f64.powf(hi.log10().ceil());
+            if self.d0 == self.d1 {
+                self.d1 *= 10.0;
+            }
+            return self;
+        }
         let (mut start, mut stop) = (self.d0, self.d1);
         let reverse = stop < start;
         if reverse {
@@ -63,7 +97,26 @@ impl Linear {
         self
     }
     pub fn ticks(&self, count: usize) -> Vec<f64> {
-        ticks(self.d0.min(self.d1), self.d0.max(self.d1), count)
+        let (lo, hi) = (self.d0.min(self.d1), self.d0.max(self.d1));
+        if self.log {
+            let (a, b) = (lo.log10().floor() as i32, hi.log10().ceil() as i32);
+            let decades = (b - a).max(1);
+            let mults: &[f64] = if decades <= 2 { &[1.0, 2.0, 5.0] } else { &[1.0] };
+            let stride = (decades as usize).div_ceil(count.max(1)).max(1) as i32;
+            let mut out = vec![];
+            let mut e = a;
+            while e <= b {
+                for m in mults {
+                    let v = m * 10f64.powi(e);
+                    if v >= lo * (1.0 - 1e-9) && v <= hi * (1.0 + 1e-9) {
+                        out.push(v);
+                    }
+                }
+                e += stride;
+            }
+            return out;
+        }
+        ticks(lo, hi, count)
     }
 }
 

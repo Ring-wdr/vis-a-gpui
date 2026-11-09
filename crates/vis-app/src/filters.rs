@@ -4,11 +4,15 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
+use std::rc::Rc;
+
+use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::accordion::Accordion;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
+use gpui_kit::component::v_virtual_list;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -18,6 +22,8 @@ use vis_core::query::summary::{ColumnSummary, column_summary};
 use vis_core::spec::Filter;
 use vis_core::store::Store;
 use vis_core::timefmt::format_kst;
+
+use crate::assets::icon;
 
 const SLIDER_STEPS: u32 = 1000;
 
@@ -43,6 +49,8 @@ pub struct FilterPanel {
     search: HashMap<String, Entity<InputState>>,
     /// draw 전에 받은 필터 (history 복원)
     preset: Vec<Filter>,
+    /// 값 목록을 누른 채 훑는 중: (컬럼, 맞출 체크 상태)
+    drag: Option<(String, bool)>,
     _subs: Vec<Subscription>,
 }
 
@@ -57,7 +65,20 @@ impl FilterPanel {
             sliders: HashMap::new(),
             search: HashMap::new(),
             preset: vec![],
+            drag: None,
             _subs: vec![],
+        }
+    }
+
+    /// 범주 값 하나를 포함(on) 또는 제외
+    fn set_value(&mut self, col: &str, value: &str, on: bool) {
+        let e = self.edits.entry(col.to_string()).or_insert(Edit::Exclude(HashSet::new()));
+        if let Edit::Exclude(s) = e {
+            if on {
+                s.remove(value);
+            } else {
+                s.insert(value.to_string());
+            }
         }
     }
 
@@ -293,6 +314,7 @@ impl FilterPanel {
                     )
                     .child(
                         Button::new(SharedString::from(format!("rst-{name}")))
+                            .icon(icon(Lucide::RotateCcw))
                             .label("전체 범위로")
                             .xsmall()
                             .ghost()
@@ -336,67 +358,78 @@ impl FilterPanel {
                 let shown_all: Vec<String> = shown.iter().map(|s| s.0.clone()).collect();
                 let shown_none = shown_all.clone();
                 let list_col = col.clone();
-                let list = uniform_list(
+                // 값이 수천 개(LOT 등)라 보이는 행만 그린다 (gpui-kit VirtualList).
+                // 원본 useDragSelect처럼 누른 채 훑으면 지나간 값을 한꺼번에 바꾼다
+                // (체크된 값에서 시작하면 해제, 해제된 값에서 시작하면 체크)
+                let sizes = Rc::new(vec![size(px(260.), px(24.)); count]);
+                let list = v_virtual_list(
+                    cx.entity(),
                     SharedString::from(format!("vals-{name}")),
-                    count,
-                    cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
+                    sizes,
+                    move |this, range, _window, cx| {
                         let excluded: HashSet<String> = match this.edits.get(&list_col) {
                             Some(Edit::Exclude(s)) => s.clone(),
                             _ => HashSet::new(),
                         };
+                        let muted = cx.theme().muted_foreground;
+                        let hover = cx.theme().list_hover;
                         range
                             .map(|i| {
                                 let (v, n) = shown[i].clone();
                                 let checked = !excluded.contains(&v);
-                                let col = list_col.clone();
-                                let value = v.clone();
+                                let (c1, c2, v1, v2) = (list_col.clone(), list_col.clone(), v.clone(), v.clone());
                                 h_flex()
+                                    .id(SharedString::from(format!("cv-{list_col}-{i}")))
                                     .h(px(24.))
                                     .px_1()
                                     .gap_1()
-                                    .child(
-                                        Checkbox::new(SharedString::from(format!("cv-{col}-{i}")))
-                                            .label(v)
-                                            .checked(checked)
-                                            .on_change(cx.listener(move |this, on: &bool, _, cx| {
-                                                let e = this.edits.entry(col.clone()).or_insert(Edit::Exclude(HashSet::new()));
-                                                if let Edit::Exclude(s) = e {
-                                                    if *on {
-                                                        s.remove(&value);
-                                                    } else {
-                                                        s.insert(value.clone());
-                                                    }
-                                                }
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(hover))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            // 시작한 값의 반대로 맞춘다
+                                            this.drag = Some((c1.clone(), !checked));
+                                            this.set_value(&c1, &v1, !checked);
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .on_mouse_move(cx.listener(move |this, e: &MouseMoveEvent, _, cx| {
+                                        if e.pressed_button != Some(MouseButton::Left) {
+                                            return;
+                                        }
+                                        if let Some((col, on)) = this.drag.clone() {
+                                            if col == c2 {
+                                                this.set_value(&c2, &v2, on);
                                                 cx.notify();
-                                            })),
-                                    )
+                                            }
+                                        }
+                                    }))
+                                    .child(Checkbox::new(SharedString::from(format!("cb-{i}"))).checked(checked).label(v))
                                     .child(div().flex_1())
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(vis_core::render::charts_fmt_int(n)),
-                                    )
+                                    .child(div().text_xs().text_color(muted).child(vis_core::render::charts_fmt_int(n)))
                             })
                             .collect()
-                    }),
+                    },
                 )
                 .h(px((count.min(10) as f32 * 24.0).max(24.0)));
                 v_flex()
                     .p_2()
                     .gap_1()
                     .when_some(self.search.get(name), |d, s| d.child(Input::new(s).small().cleanable(true)))
+                    .child(div().text_xs().text_color(theme.muted_foreground).child(format!(
+                        "{}개 중 {}개 제외 · 값 없음 {} · 누른 채 훑으면 한꺼번에 바뀝니다",
+                        values.len(),
+                        excluded.len(),
+                        nulls
+                    )))
                     .child(
                         h_flex()
                             .gap_1()
-                            .child(div().flex_1().text_xs().text_color(theme.muted_foreground).child(format!(
-                                "{}개 중 {}개 제외 · 값 없음 {}",
-                                values.len(),
-                                excluded.len(),
-                                nulls
-                            )))
                             .child(
                                 Button::new(SharedString::from(format!("all-{name}")))
+                                    .icon(icon(Lucide::SquareCheck))
                                     .label("보이는 값 선택")
                                     .xsmall()
                                     .ghost()
@@ -411,6 +444,7 @@ impl FilterPanel {
                             )
                             .child(
                                 Button::new(SharedString::from(format!("none-{name}")))
+                                    .icon(icon(Lucide::Square))
                                     .label("해제")
                                     .xsmall()
                                     .ghost()
@@ -467,6 +501,8 @@ impl Render for FilterPanel {
         }
         let n = self.active_count();
         v_flex()
+            .id("filter-panel")
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| this.drag = None))
             .w(px(300.))
             .h_full()
             .flex_shrink_0()
@@ -480,7 +516,12 @@ impl Render for FilterPanel {
                     .gap_0p5()
                     .border_b_1()
                     .border_color(theme.border)
-                    .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(format!("필터 {n}")))
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .child(icon(Lucide::Funnel).small())
+                            .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(format!("필터 {n}"))),
+                    )
                     .child(div().text_xs().text_color(theme.muted_foreground).child("draw할 때 적용됩니다.")),
             )
             .child(div().id("filter-scroll").flex_1().overflow_y_scroll().p_1().child(list))

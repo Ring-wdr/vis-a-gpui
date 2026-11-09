@@ -267,6 +267,103 @@ impl Canvas {
             .draw_pixmap(0, 0, tmp.pixmap.as_ref(), &tiny_skia::PixmapPaint::default(), t, None);
     }
 
+    /// 기울인 글자. (x, baseline)을 기준으로 align에 맞춰 놓고 angle도(시계 방향 +)만큼 돌린다
+    pub fn text_rotated(&mut self, s: &str, x: f32, baseline: f32, px: f32, c: u32, align: Align, angle: f32) {
+        if angle.abs() < 0.5 {
+            self.text(s, x, baseline, px, c, align);
+            return;
+        }
+        let w = text::measure(s, px);
+        let (asc, desc) = text::metrics(px);
+        let mut tmp = Canvas::new(w.ceil() + 2.0, (asc + desc).ceil() + 2.0, self.scale);
+        tmp.text(s, 1.0, asc + 1.0, px, c, Align::Left);
+        let ox = match align {
+            Align::Left => 1.0,
+            Align::Center => 1.0 + w / 2.0,
+            Align::Right => 1.0 + w,
+        };
+        let t = Transform::from_scale(self.scale, self.scale)
+            .pre_translate(x, baseline)
+            .pre_rotate(angle)
+            .pre_translate(-ox, -(asc + 1.0))
+            .pre_scale(1.0 / self.scale, 1.0 / self.scale);
+        let mask = self.clip.as_ref();
+        self.pixmap
+            .draw_pixmap(0, 0, tmp.pixmap.as_ref(), &tiny_skia::PixmapPaint::default(), t, mask);
+    }
+
+    /// 굵은 글자 (글꼴 하나라 0.5px 옆으로 한 번 더 찍는다)
+    pub fn text_bold(&mut self, s: &str, x: f32, baseline: f32, px: f32, c: u32, align: Align) {
+        self.text(s, x, baseline, px, c, align);
+        self.text(s, x + 0.5, baseline, px, c, align);
+    }
+
+    /// 점 모양 stamp (모양 › 기본 모양 · 적용). fill이 None이면 테두리만
+    pub fn stamp_shape(
+        &self,
+        radius: f32,
+        shape: crate::options::PointShape,
+        fill: Option<u32>,
+        border: Option<(u32, f32)>,
+        alpha: f32,
+    ) -> Stamp {
+        use crate::options::PointShape;
+        if shape == PointShape::Circle && fill.is_some() {
+            return self.stamp(radius, fill.unwrap(), border, alpha);
+        }
+        let r = radius * self.scale;
+        let bw = border.map(|b| b.1 * self.scale).unwrap_or(0.0);
+        let half = (r + bw).ceil() as i32 + 2;
+        let size = (half * 2 + 1) as u32;
+        let mut pm = Pixmap::new(size, size).unwrap();
+        let c = half as f32 + 0.5;
+        let path = shape_path(shape, c, c, r);
+        if let Some(p) = path {
+            if let Some(f) = fill {
+                if shape == PointShape::Cross {
+                    let st = Stroke {
+                        width: (r * 0.6).max(1.0),
+                        ..Default::default()
+                    };
+                    pm.stroke_path(&p, &paint(f, alpha), &st, Transform::identity(), None);
+                } else {
+                    pm.fill_path(&p, &paint(f, alpha), FillRule::Winding, Transform::identity(), None);
+                }
+            }
+            if let Some((bc, _)) = border {
+                let st = Stroke {
+                    width: bw.max(1.0),
+                    ..Default::default()
+                };
+                pm.stroke_path(&p, &paint(bc, alpha), &st, Transform::identity(), None);
+            }
+        }
+        Stamp {
+            half,
+            size: size as i32,
+            pixels: pm.pixels().to_vec(),
+        }
+    }
+
+    /// 영역 밖(even-odd)을 칠한다: 사각형 rect에서 다각형 hole을 뺀 곳
+    pub fn fill_outside(&mut self, rect: (f32, f32, f32, f32), hole: &[(f32, f32)], c: u32, alpha: f32) {
+        let mut pb = PathBuilder::new();
+        if let Some(r) = Rect::from_xywh(rect.0, rect.1, rect.2, rect.3) {
+            pb.push_rect(r);
+        }
+        if let Some((&first, rest)) = hole.split_first() {
+            pb.move_to(first.0, first.1);
+            for p in rest {
+                pb.line_to(p.0, p.1);
+            }
+            pb.close();
+        }
+        if let Some(p) = pb.finish() {
+            let mask = self.clip.as_ref();
+            self.pixmap.fill_path(&p, &paint(c, alpha), FillRule::EvenOdd, self.ts, mask);
+        }
+    }
+
     // ── 점 찍기 (scatter): 미리 그린 원 하나를 픽셀 단위로 겹쳐 놓는다 ─────────────
 
     pub fn stamp(&self, radius: f32, fill: u32, border: Option<(u32, f32)>, alpha: f32) -> Stamp {
@@ -417,4 +514,26 @@ pub fn rounded_rect(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<Path> {
     pb.cubic_to(x, y + r - k, x + r - k, y, x + r, y);
     pb.close();
     pb.finish()
+}
+
+/// 점 모양 경로 (중심 cx, cy, 반지름 r)
+pub fn shape_path(shape: crate::options::PointShape, cx: f32, cy: f32, r: f32) -> Option<Path> {
+    use crate::options::PointShape;
+    match shape {
+        PointShape::Circle => PathBuilder::from_circle(cx, cy, r),
+        PointShape::Square => {
+            let h = r * 0.886;
+            Rect::from_xywh(cx - h, cy - h, h * 2.0, h * 2.0).map(PathBuilder::from_rect)
+        }
+        PointShape::Triangle => polygon(&[(cx, cy - r * 1.15), (cx + r, cy + r * 0.75), (cx - r, cy + r * 0.75)]),
+        PointShape::Diamond => polygon(&[(cx, cy - r * 1.2), (cx + r, cy), (cx, cy + r * 1.2), (cx - r, cy)]),
+        PointShape::Cross => {
+            let mut pb = PathBuilder::new();
+            pb.move_to(cx - r, cy);
+            pb.line_to(cx + r, cy);
+            pb.move_to(cx, cy - r);
+            pb.line_to(cx, cy + r);
+            pb.finish()
+        }
+    }
 }

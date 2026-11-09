@@ -32,6 +32,8 @@ pub enum AxisKind {
     Time,
     /// 범주 인덱스 (0, 1, 2 …)
     Index,
+    /// 로그 숫자 축 (축 › 로그 축)
+    Log,
 }
 
 /// 데이터 값 ↔ 픽셀. 확대 영역을 데이터 범위로 바꿀 때 쓴다.
@@ -50,7 +52,21 @@ impl AxisMeta {
         } else {
             0.5
         };
+        if self.kind == AxisKind::Log && self.domain.0 > 0.0 && self.domain.1 > 0.0 {
+            let (a, b) = (self.domain.0.log10(), self.domain.1.log10());
+            return 10f64.powf(a + (b - a) * t as f64);
+        }
         self.domain.0 + (self.domain.1 - self.domain.0) * t as f64
+    }
+    /// 데이터 값 → 픽셀
+    pub fn map(&self, v: f64) -> f32 {
+        let (a, b, v) = if self.kind == AxisKind::Log && self.domain.0 > 0.0 && self.domain.1 > 0.0 {
+            (self.domain.0.log10(), self.domain.1.log10(), v.max(1e-300).log10())
+        } else {
+            (self.domain.0, self.domain.1, v)
+        };
+        let t = if b != a { (v - a) / (b - a) } else { 0.5 };
+        self.range.0 + (self.range.1 - self.range.0) * t as f32
     }
 }
 
@@ -75,6 +91,23 @@ pub enum HitShape {
 }
 
 impl HitShape {
+    /// 대표 픽셀: 사각형은 위쪽 가운데(막대 끝), 원은 중심, 다각형은 꼭짓점 평균, 고리 조각은 가운데 각도
+    pub fn anchor(&self) -> (f32, f32) {
+        match self {
+            HitShape::Rect(r) => (r.x + r.w / 2.0, r.y + r.h / 2.0),
+            HitShape::Circle { cx, cy, .. } => (*cx, *cy),
+            HitShape::Polygon(p) => {
+                let n = p.len().max(1) as f32;
+                (p.iter().map(|q| q.0).sum::<f32>() / n, p.iter().map(|q| q.1).sum::<f32>() / n)
+            }
+            HitShape::Arc { cx, cy, r0, r1, a0, a1 } => {
+                let a = (a0 + a1) / 2.0;
+                let r = (r0 + r1) / 2.0;
+                (cx + r * a.sin(), cy - r * a.cos())
+            }
+        }
+    }
+
     pub fn contains(&self, x: f32, y: f32) -> bool {
         match self {
             HitShape::Rect(r) => r.contains(x, y),
@@ -199,6 +232,12 @@ pub struct ItemMeta {
     pub summary: String,
     /// legend 값 목록과 색 (점 툴팁의 legend 이름)
     pub legend_values: Vec<(String, u32)>,
+    /// 선택 영역 안 점 수 (점 차트가 직접 센다). 없으면 고른 도형 수
+    pub selected: Option<usize>,
+    /// 도형의 대표 픽셀 (선택 판정. 없으면 도형 가운데): (hits 번호, 좌표)
+    pub anchors: Vec<(usize, (f32, f32))>,
+    /// 툴팁 모양 (차트 속성 › 툴팁)
+    pub tooltip: crate::options::TooltipOptions,
 }
 
 impl ItemMeta {
@@ -214,6 +253,9 @@ impl ItemMeta {
             legend: vec![],
             summary: String::new(),
             legend_values: vec![],
+            selected: None,
+            anchors: vec![],
+            tooltip: crate::options::ChartOptions::default().tooltip,
         }
     }
 

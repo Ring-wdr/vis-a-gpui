@@ -238,6 +238,8 @@ pub fn spec(dataset: &str, chart: ChartType, x: &str, y: &str, split: &[&str], l
         grid: (3, 3),
         common: CommonProps::default(),
         filters: vec![],
+        sub_type: None,
+        show_nearest: true,
     }
 }
 
@@ -297,6 +299,7 @@ pub fn run_draw(ds: &Arc<Dataset>, spec: &ChartSpec, workers: usize, size: (f32,
         states: Arc::new(|_| ItemState::default()),
         only: None,
         opts: RenderOptions {
+            separator: None,
             common: None,
             width: size.0,
             height: size.1,

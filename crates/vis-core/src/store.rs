@@ -23,6 +23,11 @@ pub struct DatasetInfo {
     /// 적재에 걸린 시간 (ms)
     #[serde(default)]
     pub load_ms: f64,
+    /// 업로드: 원본 파일 이름과 적재 옵션 (수정 = 보관한 원본을 이 옵션으로 다시 적재)
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub options: Option<crate::csv_import::CsvOptions>,
 }
 
 #[derive(Clone, Debug)]
@@ -97,6 +102,8 @@ impl Store {
                 created_ms: 0,
                 sample: true,
                 load_ms: 0.0,
+                source: None,
+                options: None,
             });
             let st = self.state(s.id);
             out.push((info, st));
@@ -115,6 +122,8 @@ impl Store {
                             created_ms: 0,
                             sample: false,
                             load_ms: 0.0,
+                            source: None,
+                            options: None,
                         },
                         DatasetState::Loading(*p),
                     ),
@@ -168,6 +177,8 @@ impl Store {
             created_ms: ds.created_ms,
             sample,
             load_ms: started.elapsed().as_secs_f64() * 1000.0,
+            source: None,
+            options: None,
         };
         let _ = ds.save(&self.file(&ds.id));
         let ds = Arc::new(ds);
@@ -195,28 +206,98 @@ impl Store {
         Some(ds)
     }
 
-    /// CSV 파일 가져오기
+    fn source_file(&self, id: &str) -> PathBuf {
+        self.dir.join("datasets").join(format!("{id}.src"))
+    }
+
+    /// CSV(또는 CSV zip) 가져오기. 원본은 수정(다시 적재)에 쓰도록 보관한다
     pub fn import_csv(&self, path: &std::path::Path, opts: &crate::csv_import::CsvOptions) -> Result<Arc<Dataset>, String> {
         let id = format!("up-{}", chrono::Utc::now().timestamp_millis());
-        self.loading.lock().insert(id.clone(), 0.0);
+        self.load_upload(&id, path, opts, None)
+    }
+
+    fn load_upload(
+        &self,
+        id: &str,
+        path: &std::path::Path,
+        opts: &crate::csv_import::CsvOptions,
+        keep_created: Option<i64>,
+    ) -> Result<Arc<Dataset>, String> {
+        self.loading.lock().insert(id.to_string(), 0.0);
         let started = Instant::now();
-        let res = crate::csv_import::import(path, &id, opts, |p| {
-            self.loading.lock().insert(id.clone(), p);
+        let res = crate::csv_import::import(path, id, opts, |p| {
+            self.loading.lock().insert(id.to_string(), p);
         });
-        self.loading.lock().remove(&id);
+        self.loading.lock().remove(id);
         match res {
-            Ok(ds) => Ok(self.finish(ds, false, started)),
+            Ok(mut ds) => {
+                if let Some(c) = keep_created {
+                    ds.created_ms = c;
+                }
+                let src = self.source_file(id);
+                if path != src {
+                    let _ = std::fs::copy(path, &src);
+                }
+                let source = path.file_name().map(|f| f.to_string_lossy().into_owned());
+                self.loaded.lock().remove(id);
+                let ds = self.finish(ds, false, started);
+                {
+                    let mut idx = self.index.lock();
+                    if let Some(i) = idx.iter_mut().find(|i| i.id == id) {
+                        if keep_created.is_none() || i.source.is_none() {
+                            i.source = source;
+                        }
+                        i.options = Some(opts.clone());
+                    }
+                }
+                self.save_index();
+                Ok(ds)
+            }
             Err(e) => {
-                self.failed.lock().insert(id, e.clone());
+                if keep_created.is_none() {
+                    self.failed.lock().insert(id.to_string(), e.clone());
+                }
                 Err(e)
             }
         }
+    }
+
+    /// 수정: 보관한 원본을 새 옵션으로 다시 적재한다 (등록 시간 유지). 거절되면 기존 데이터를 그대로 둔다
+    pub fn reimport(&self, id: &str, opts: &crate::csv_import::CsvOptions) -> Result<Arc<Dataset>, String> {
+        let info = self.index.lock().iter().find(|i| i.id == id).cloned().ok_or("없는 데이터입니다.")?;
+        if info.sample {
+            return Err("샘플은 수정할 수 없습니다.".into());
+        }
+        let src = self.source_file(id);
+        if !src.exists() {
+            return Err("보관한 원본이 없어 다시 적재할 수 없습니다.".into());
+        }
+        let source = info.source.clone();
+        let r = self.load_upload(id, &src, opts, Some(info.created_ms));
+        if r.is_ok() {
+            let mut idx = self.index.lock();
+            if let Some(i) = idx.iter_mut().find(|i| i.id == id) {
+                i.source = source;
+            }
+        }
+        self.save_index();
+        r
+    }
+
+    /// 보관한 원본 경로 (수정 팝업 미리보기)
+    pub fn source_path(&self, id: &str) -> Option<PathBuf> {
+        Some(self.source_file(id)).filter(|p| p.exists())
+    }
+
+    pub fn info(&self, id: &str) -> Option<DatasetInfo> {
+        self.index.lock().iter().find(|i| i.id == id).cloned()
     }
 
     pub fn delete(&self, id: &str) {
         self.loaded.lock().remove(id);
         self.index.lock().retain(|i| i.id != id);
         let _ = std::fs::remove_file(self.file(id));
+        let _ = std::fs::remove_file(self.source_file(id));
         self.save_index();
     }
 

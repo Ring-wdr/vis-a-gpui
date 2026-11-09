@@ -26,7 +26,11 @@ pub struct BoxStats {
     pub hi: f64,
     pub outlier_count: u32,
     pub outliers: Vec<f64>,
+    /// boxplot dot 하위 차트: 원값 표본 (고르게 최대 DOT_SAMPLE개)
+    pub dots: Vec<f64>,
 }
+
+pub const DOT_SAMPLE: usize = 200;
 
 /// item 하나의 [범주][legend 값] 칸
 #[derive(Clone, Debug, Default)]
@@ -72,6 +76,7 @@ pub fn query_category(q: &CategoryQuery, groups: &Groups) -> QResult<(Vec<Catego
         xc * lw + legend.as_ref().map(|l| l.at(r) as u64).unwrap_or(0)
     };
     let space = Some((xlen as u64 + 1) * lw);
+    let lkey = |r: u32| legend.as_ref().map(|l| l.at(r) as u64).unwrap_or(0);
 
     let items = if q.chart == ChartType::Boxplot {
         par_groups(groups, |_, rows| {
@@ -117,8 +122,8 @@ pub fn query_category(q: &CategoryQuery, groups: &Groups) -> QResult<(Vec<Catego
                 item.bars.last_mut().unwrap()[lc] = Some(v);
             }
             match q.chart {
-                ChartType::Pie => top_with_others(item, rows, PIE_TOP + 1, true, xcodes, xdict, y, q.agg),
-                ChartType::Funnel => top_with_others(item, rows, FUNNEL_MAX, false, xcodes, xdict, y, q.agg),
+                ChartType::Pie => top_with_others(item, rows, PIE_TOP + 1, true, xcodes, xdict, y, q.agg, lw, &lkey),
+                ChartType::Funnel => top_with_others(item, rows, FUNNEL_MAX, false, xcodes, xdict, y, q.agg, lw, &lkey),
                 ChartType::Radar => radar_axes(item),
                 _ => item,
             }
@@ -157,6 +162,11 @@ fn box_stats(sorted: &[f64]) -> BoxStats {
         hi,
         outlier_count: count,
         outliers,
+        dots: if n <= DOT_SAMPLE {
+            sorted.to_vec()
+        } else {
+            (0..DOT_SAMPLE).map(|k| sorted[k * (n - 1) / (DOT_SAMPLE - 1)]).collect()
+        },
     }
 }
 
@@ -172,28 +182,39 @@ fn top_with_others(
     xdict: &[String],
     y: &[f64],
     agg: AggFn,
+    lw: u64,
+    lkey: &(dyn Fn(u32) -> u64 + Sync),
 ) -> CategoryItem {
-    let mut ranked: Vec<(String, f64)> = item
+    // legend가 있으면(pie sunburst) 범주 값은 legend 값별 몫의 합이고, 칸 전체를 그대로 가져간다
+    let mut ranked: Vec<(String, f64, Vec<Option<f64>>)> = item
         .categories
         .into_iter()
         .zip(item.bars)
-        .filter_map(|(c, cell)| cell[0].map(|v| (c, v)))
-        .filter(|(_, v)| v.is_finite() && (!positive || *v > 0.0))
+        .filter_map(|(c, cell)| {
+            let v = if lw > 1 {
+                let s: f64 = cell.iter().flatten().filter(|v| !positive || **v > 0.0).sum();
+                (s != 0.0).then_some(s)
+            } else {
+                cell[0]
+            };
+            v.map(|v| (c, v, cell))
+        })
+        .filter(|(_, v, _)| v.is_finite() && (!positive || *v > 0.0))
         .collect();
     // 큰 순, 같으면 이름 순 (안정 정렬이라 원래 순서가 이름 순이다)
     ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
     let mut out = CategoryItem::default();
     if ranked.len() <= max {
-        for (c, v) in ranked {
+        for (c, _, cell) in ranked {
             out.categories.push(c);
-            out.bars.push(vec![Some(v)]);
+            out.bars.push(cell);
         }
         return out;
     }
     let keep: std::collections::HashSet<String> = ranked[..max - 1].iter().map(|r| r.0.clone()).collect();
-    for (c, v) in ranked.iter().take(max - 1) {
+    for (c, _, cell) in ranked.iter().take(max - 1) {
         out.categories.push(c.clone());
-        out.bars.push(vec![Some(*v)]);
+        out.bars.push(cell.clone());
     }
     let rest: Vec<u32> = rows
         .iter()
@@ -209,10 +230,15 @@ fn top_with_others(
         })
         .filter(|&r| !positive || y[r as usize] > 0.0 || agg == AggFn::Count)
         .collect();
-    let v = agg_by_key(&rest, |_| 0, y, agg, Some(1)).first().map(|p| p.1);
-    if let Some(v) = v.filter(|v| !positive || *v > 0.0) {
+    let mut cell = vec![None; lw as usize];
+    for (k, v) in agg_by_key(&rest, lkey, y, agg, Some(lw)) {
+        if !positive || v > 0.0 {
+            cell[k as usize] = Some(v);
+        }
+    }
+    if cell.iter().any(|v| v.is_some()) {
         out.categories.push(OTHERS.into());
-        out.bars.push(vec![Some(v)]);
+        out.bars.push(cell);
         out.has_others = true;
     }
     out

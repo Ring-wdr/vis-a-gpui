@@ -88,3 +88,80 @@ pub fn sequential(t: f32) -> u32 {
     let i = (x.floor() as usize).min(stops.len() - 2);
     mix(stops[i], stops[i + 1], x - i as f32)
 }
+
+/// 렌더 스타일: 테마 색 + 합친 차트 속성. 렌더러는 `t.surface`처럼 색을, `t.o.title`처럼 속성을 읽는다.
+/// 색은 속성에서 온다(패널 배경 = surface, 축 글자 = text_secondary …). 다크 테마는 속성 기본값이 이미 다크 값이다.
+pub struct Style {
+    pub c: Theme,
+    pub o: crate::options::ChartOptions,
+    /// item 크기 (글자 크기 자동)
+    pub size: (f32, f32),
+    pub compact: bool,
+}
+
+impl std::ops::Deref for Style {
+    type Target = Theme;
+    fn deref(&self) -> &Theme {
+        &self.c
+    }
+}
+
+/// 비었거나 잘못된 색이면 fallback
+pub fn color_or(hex: &str, fallback: u32) -> u32 {
+    parse_hex(hex).unwrap_or(fallback)
+}
+
+impl Style {
+    pub fn new(theme_kind: ChartTheme, o: crate::options::ChartOptions, size: (f32, f32), compact: bool) -> Style {
+        let base = theme(theme_kind);
+        let c = Theme {
+            surface: color_or(&o.panel.back_color, base.surface),
+            text_primary: color_or(&o.title.color, base.text_primary),
+            text_secondary: color_or(&o.axes.y.label.color, base.text_secondary),
+            text_muted: color_or(&o.title.summary.color, base.text_muted),
+            grid: color_or(&o.axes.y.grid.color, base.grid),
+            axis: color_or(&o.axes.x.line.color, base.axis),
+            selection: base.selection,
+        };
+        Style { c, o, size, compact }
+    }
+    /// 구역 글자 크기: 자동이면 item 크기에 맞춰, 아니면 구역 값
+    pub fn font(&self, fixed: f32, base: f32) -> f32 {
+        crate::options::font_px(&self.o, fixed, base, self.size.0, self.size.1)
+    }
+    /// 도형 불투명도 (모양 › 투명도)
+    pub fn shape_alpha(&self) -> f32 {
+        1.0 - self.o.shape.transparency.clamp(0.0, 0.95)
+    }
+    /// 도형 테두리: 정한 색, 없으면 자동(굵기를 정했으면 배경색, 아니면 도형 색을 진하게)
+    pub fn border_of(&self, fill: u32) -> u32 {
+        match parse_hex(&self.o.shape.border_color) {
+            Some(c) => c,
+            None if self.o.shape.border_width > 0.0 => self.surface,
+            None => mix(fill, 0x000000, 0.25),
+        }
+    }
+    pub fn others_color(&self) -> u32 {
+        color_or(&self.o.palette.others_color, OTHERS_COLOR)
+    }
+}
+
+/// 팔레트 › 그라데이션: 시작 → (중간) → 끝을 n단계로 (steps가 0이면 n)
+pub fn gradient_palette(p: &crate::options::PaletteOptions, n: usize) -> Vec<u32> {
+    let steps = if p.steps == 0 { n.max(1) } else { p.steps as usize };
+    let start = color_or(&p.start, 0xcfe3fa);
+    let end = color_or(&p.end, 0x0d3d78);
+    let middle = parse_hex(&p.middle);
+    let at = |t: f32| match middle {
+        Some(m) if t <= 0.5 => mix(start, m, t * 2.0),
+        Some(m) => mix(m, end, (t - 0.5) * 2.0),
+        None => mix(start, end, t),
+    };
+    let mut cols: Vec<u32> = (0..steps)
+        .map(|i| at(if steps <= 1 { 0.0 } else { i as f32 / (steps - 1) as f32 }))
+        .collect();
+    if p.reverse {
+        cols.reverse();
+    }
+    (0..n).map(|i| cols[i % cols.len()]).collect()
+}

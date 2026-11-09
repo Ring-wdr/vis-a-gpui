@@ -125,6 +125,60 @@ impl ChartType {
     }
 }
 
+/// 하위 차트 (원본 chart-fields.ts SUB_TYPES). 차트마다 첫 값이 기본이다
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SubType {
+    None,
+    Ecdf,
+    Ncdf,
+    Probability,
+    Side,
+    Stack,
+    Stack100,
+    Dot,
+    Doughnut,
+    Pie3d,
+    Sunburst,
+}
+
+impl SubType {
+    pub fn label(self) -> &'static str {
+        match self {
+            SubType::None => "기본",
+            SubType::Ecdf => "ECDF (누적 비율)",
+            SubType::Ncdf => "정규 CDF",
+            SubType::Probability => "정규 확률",
+            SubType::Side => "나란히",
+            SubType::Stack => "쌓기",
+            SubType::Stack100 => "100% 쌓기",
+            SubType::Dot => "점 겹치기",
+            SubType::Doughnut => "도넛",
+            SubType::Pie3d => "3D",
+            SubType::Sunburst => "선버스트",
+        }
+    }
+}
+
+impl ChartType {
+    /// 하위 차트 목록. 첫 값이 기본이고, 빈 목록이면 하위 차트가 없다
+    pub fn sub_types(self) -> &'static [SubType] {
+        use SubType::*;
+        match self {
+            ChartType::Line => &[None, Ecdf, Ncdf, Probability],
+            ChartType::Bar => &[Side, Stack, Stack100],
+            ChartType::Boxplot => &[None, Dot],
+            ChartType::Pie => &[None, Doughnut, Pie3d, Sunburst],
+            _ => &[],
+        }
+    }
+
+    /// 확대·이동 (원본 차트별 상단 도구 줄 표)
+    pub fn can_zoom(self) -> bool {
+        !matches!(self, ChartType::Sankey | ChartType::Pie | ChartType::Radar | ChartType::Funnel)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum AggFn {
@@ -195,6 +249,9 @@ pub struct CommonProps {
     /// legend 값별 색 (없으면 팔레트 순서)
     #[serde(default)]
     pub legend_colors: std::collections::BTreeMap<String, String>,
+    /// 차트 속성 부분 값 (options.rs, JSON 객체)
+    #[serde(default)]
+    pub options: serde_json::Value,
 }
 
 impl Default for CommonProps {
@@ -204,6 +261,7 @@ impl Default for CommonProps {
             legend_position: LegendPosition::Top,
             transparency: 0.0,
             legend_colors: Default::default(),
+            options: serde_json::Value::Null,
         }
     }
 }
@@ -227,9 +285,58 @@ pub struct ChartSpec {
     pub common: CommonProps,
     #[serde(default)]
     pub filters: Vec<Filter>,
+    /// 하위 차트. 없거나 그 차트에 없는 값이면 기본
+    #[serde(default)]
+    pub sub_type: Option<SubType>,
+    /// 툴팁: 가리킨 자리에서 가장 가까운 점을 표시 (전체 설정 › 툴팁)
+    #[serde(default = "yes")]
+    pub show_nearest: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl ChartSpec {
+    /// 그릴 하위 차트 (없는 차트면 None)
+    pub fn sub_type(&self) -> Option<SubType> {
+        let list = self.chart_type.sub_types();
+        let first = *list.first()?;
+        Some(self.sub_type.filter(|s| list.contains(s)).unwrap_or(first))
+    }
+    /// line의 분포 하위 차트 (점 좌표가 원래 컬럼 값이 아니다)
+    pub fn distribution(&self) -> Option<crate::analytics::Distribution> {
+        use crate::analytics::Distribution;
+        match (self.chart_type, self.sub_type()) {
+            (ChartType::Line, Some(SubType::Ecdf)) => Some(Distribution::Ecdf),
+            (ChartType::Line, Some(SubType::Ncdf)) => Some(Distribution::Ncdf),
+            (ChartType::Line, Some(SubType::Probability)) => Some(Distribution::Probability),
+            _ => None,
+        }
+    }
+    /// 사각형·자유형 삭제를 할 수 있는지 (scatter, 분포가 아닌 line)
+    pub fn can_delete(&self) -> bool {
+        matches!(self.chart_type, ChartType::Scatter | ChartType::Line) && self.distribution().is_none()
+    }
+    /// 선택 영역으로 데이터 표·다운로드의 행을 거르는 차트
+    pub fn filters_rows_by_selection(&self) -> bool {
+        matches!(
+            self.chart_type,
+            ChartType::Scatter | ChartType::Bar | ChartType::Boxplot | ChartType::Line | ChartType::Histogram | ChartType::Waterfall
+        ) && self.distribution().is_none()
+    }
+    /// 그릴 때 쓰는 legend 컬럼 (pie sunburst는 legend 컬럼을 바깥 고리로 쓴다)
+    pub fn legend_column(&self) -> Option<&str> {
+        if self.chart_type == ChartType::Pie && self.sub_type() == Some(SubType::Sunburst) {
+            return self.legend.as_deref();
+        }
+        if self.chart_type.fields().legend {
+            self.legend.as_deref()
+        } else {
+            None
+        }
+    }
+
     pub fn summary(&self) -> String {
         let mut s = format!("{} · {}", self.chart_type.label(), self.x);
         if self.chart_type.fields().y.is_some() {
@@ -261,6 +368,24 @@ pub struct ItemState {
     pub legend_colors: std::collections::BTreeMap<String, String>,
     #[serde(default)]
     pub legend_position: Option<LegendPosition>,
+    /// item 개별 차트 속성 부분 값 (options.rs)
+    #[serde(default)]
+    pub options: serde_json::Value,
+    /// 도형 (데이터 좌표)
+    #[serde(default)]
+    pub shapes: Vec<crate::region::Shape>,
+    /// 선택 영역 (item마다 하나)
+    #[serde(default)]
+    pub selection: Option<crate::region::Region>,
+    /// 즐겨찾기 (이름 붙여 남긴 영역)
+    #[serde(default)]
+    pub favorites: Vec<crate::region::NamedRegion>,
+    /// 새 범례: 영역 안의 점을 새 legend 항목으로 칠한다
+    #[serde(default)]
+    pub legend_groups: Vec<crate::region::NamedRegion>,
+    /// 지운 영역 (scatter, line)
+    #[serde(default)]
+    pub deletions: Vec<crate::region::Region>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -269,4 +394,43 @@ pub enum ChartTheme {
     #[default]
     Light,
     Dark,
+}
+
+/// 툴팁에 더 보여줄 컬럼 (vis-a-lot `features/item-tooltip/lib/tooltip-columns.ts`의 liveTooltipColumns).
+/// 왼쪽 패널의 tooltip 선택(draft)을 draw 없이 바로 따른다. 값은 가리킨 행 번호로 읽으므로 다시 그릴 필요가 없다.
+/// 패널에서 데이터셋을 바꿨으면 그린 차트의 데이터셋에 없는 컬럼은 읽을 수 없어 뺀다.
+/// 그린 차트의 x, y는 이미 툴팁 줄로 보이므로 뺀다. 그린 데이터셋의 컬럼을 모르면 아무것도 고르지 않는다.
+pub fn live_tooltip_columns(selected: &[String], drawn_columns: Option<&[String]>, drawn: Option<(&str, &str)>) -> Vec<String> {
+    let Some(names) = drawn_columns else { return vec![] };
+    selected
+        .iter()
+        .filter(|c| names.contains(c) && drawn.is_none_or(|(x, y)| c.as_str() != x && c.as_str() != y))
+        .cloned()
+        .collect()
+}
+
+#[cfg(test)]
+mod tooltip_tests {
+    use super::live_tooltip_columns;
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn keeps_selected_order_and_drawn_dataset_columns() {
+        let cols = s(&["a", "b", "c", "d"]);
+        assert_eq!(live_tooltip_columns(&s(&["c", "zz", "a"]), Some(&cols), None), s(&["c", "a"]));
+    }
+
+    #[test]
+    fn drops_drawn_x_y() {
+        let cols = s(&["a", "b", "c", "d"]);
+        assert_eq!(live_tooltip_columns(&s(&["a", "b", "c"]), Some(&cols), Some(("a", "b"))), s(&["c"]));
+    }
+
+    #[test]
+    fn nothing_before_schema() {
+        assert!(live_tooltip_columns(&s(&["a"]), None, None).is_empty());
+    }
 }

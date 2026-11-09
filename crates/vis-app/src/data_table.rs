@@ -87,20 +87,41 @@ impl TableDelegate for RowsDelegate {
 
 /// 다이얼로그로 연다
 pub fn open(title: String, ds: Arc<Dataset>, rows: Vec<u32>, filters: usize, window: &mut Window, cx: &mut App) {
-    let n = rows.len();
+    let subtitle = format!(
+        "{}행 · draw 필터 {}개 적용 · 체크박스로 끈 legend 값·지운 점은 빠짐",
+        vis_core::render::charts_fmt_int(rows.len()),
+        filters
+    );
+    open_with(format!("데이터 테이블 · {title}"), subtitle, ds, rows, window, cx);
+}
+
+/// 전체 데이터 테이블 (원본 TableProperties): 데이터셋 전체에서 고르게 뽑은 30,000행 표본
+pub const FULL_SAMPLE: usize = 30_000;
+
+pub fn open_full(ds: Arc<Dataset>, window: &mut Window, cx: &mut App) {
+    let total = ds.rows;
+    let rows: Vec<u32> = if total <= FULL_SAMPLE {
+        (0..total as u32).collect()
+    } else {
+        (0..FULL_SAMPLE).map(|k| (k * total / FULL_SAMPLE) as u32).collect()
+    };
+    let subtitle = format!(
+        "전체 {}행 중 {}행 (고르게 뽑은 표본, 필터·split 미적용)",
+        vis_core::render::charts_fmt_int(total),
+        vis_core::render::charts_fmt_int(rows.len())
+    );
+    open_with(format!("전체 데이터 · {}", ds.name), subtitle, ds, rows, window, cx);
+}
+
+fn open_with(title: String, subtitle: String, ds: Arc<Dataset>, rows: Vec<u32>, window: &mut Window, cx: &mut App) {
     let state = cx.new(|cx| {
         TableState::new(RowsDelegate::new(ds, rows), window, cx)
             .sortable(true)
             .col_resizable(true)
     });
-    let subtitle = format!(
-        "{}행 · draw 필터 {}개 적용 · 체크박스로 끈 legend 값은 빠짐",
-        vis_core::render::charts_fmt_int(n),
-        filters
-    );
     window.open_dialog(cx, move |dialog, _, _| {
         dialog
-            .title(format!("데이터 테이블 · {title}"))
+            .title(title.clone())
             .width(px(1000.))
             .child(div().text_xs().pb_2().child(subtitle.clone()))
             .child(div().h(px(520.)).child(DataTable::new(&state).stripe(true).bordered(true)))

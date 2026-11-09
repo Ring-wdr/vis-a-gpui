@@ -61,12 +61,11 @@ impl ChartData {
         self.groups.is_empty()
     }
     pub fn item_name(&self, i: usize) -> String {
+        self.item_name_with(i, &self.spec.split_separator)
+    }
+    pub fn item_name_with(&self, i: usize, sep: &str) -> String {
         let l = &self.groups.labels[i];
-        if l.is_empty() {
-            self.spec.summary()
-        } else {
-            l.join(&self.spec.split_separator)
-        }
+        if l.is_empty() { self.spec.summary() } else { l.join(sep) }
     }
 }
 
@@ -88,7 +87,7 @@ pub fn query(dataset: &Arc<Dataset>, spec: &ChartSpec) -> QResult<ChartData> {
         )?),
         None => None,
     };
-    let legend_name = if fields.legend { spec.legend.as_deref() } else { None };
+    let legend_name = spec.legend_column();
     let legend = match legend_name {
         Some(l) => Some(LegendCodes::of(ds, l)?),
         None => None,
@@ -174,6 +173,8 @@ pub struct RenderedItem {
 
 #[derive(Clone)]
 pub struct RenderOptions {
+    /// split 구분 기호 덮어쓰기 (전체 설정에서 바꾸면 쿼리를 다시 하지 않고 제목만 바꾼다)
+    pub separator: Option<String>,
     /// 공통 속성 덮어쓰기. 화면에서 전체 설정을 바꾸면 쿼리를 다시 하지 않고 이 값으로 다시 그린다
     pub common: Option<crate::spec::CommonProps>,
     pub width: f32,
@@ -211,7 +212,27 @@ pub fn render_item(
         .and_then(parse_hex)
         .or_else(|| parse_hex(&spec.common.color))
         .unwrap_or(palette(0));
-    let alpha = 1.0 - spec.common.transparency.clamp(0.0, 0.95);
+    let o = crate::options::resolve(spec.chart_type, opts.theme, &spec.common.options, &state.options);
+    let alpha = (1.0 - spec.common.transparency.clamp(0.0, 0.95)) * (1.0 - o.shape.transparency.clamp(0.0, 0.95));
+    // 팔레트: 그라데이션이면 시작 → 끝 단계 색, 아니면 기본 팔레트. '기타'는 팔레트 › 기타 색
+    let others = parse_hex(&o.palette.others_color).unwrap_or(OTHERS_COLOR);
+    let base_colors = |values: &[String]| -> Vec<u32> {
+        let grad = o
+            .palette
+            .gradient
+            .then(|| crate::render::theme::gradient_palette(&o.palette, values.len()));
+        values
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                if v == crate::query::category::OTHERS {
+                    others
+                } else {
+                    grad.as_ref().map(|g| g[i]).unwrap_or_else(|| palette(i))
+                }
+            })
+            .collect()
+    };
     let hidden_of = |values: &[String]| values.iter().map(|v| state.hidden_legend.contains(v)).collect::<Vec<_>>();
     let mk_legend = |title: &str, values: Vec<String>, colors: Vec<u32>| {
         let hidden = hidden_of(&values);
@@ -238,17 +259,80 @@ pub fn render_item(
     let mut legend = data
         .legend_values
         .as_ref()
-        .and_then(|v| mk_legend(spec.legend.as_deref().unwrap_or(""), v.clone(), data.legend_colors.clone()));
+        .and_then(|v| mk_legend(spec.legend.as_deref().unwrap_or(""), v.clone(), base_colors(v)));
     let rows = data.groups.rows_of(index);
     let points_store;
     let item_data = match &data.payload {
         Payload::Points { x, y, x_time, legend: lg } => {
             let ds = &data.dataset;
             let codes = lg.and_then(|l| LegendCodes::of(ds, &ds.columns[l].name).ok());
-            points_store = gather(rows, ds.columns[*x].nums().unwrap(), ds.columns[*y].nums().unwrap(), codes.as_ref());
+            let mut pd = gather(rows, ds.columns[*x].nums().unwrap(), ds.columns[*y].nums().unwrap(), codes.as_ref());
+            let mut x_time = *x_time;
+            // 식 (x, y에 적용). 값이 유한하지 않은 점은 뺀다
+            let ex = crate::analytics::Expr::compile(&o.expression.x).ok().flatten();
+            let ey = crate::analytics::Expr::compile(&o.expression.y).ok().flatten();
+            if ex.is_some() || ey.is_some() {
+                for i in 0..pd.xs.len() {
+                    let (vx, vy) = (pd.xs[i], pd.ys[i]);
+                    if let Some(e) = &ex {
+                        pd.xs[i] = e.eval(vx, vy);
+                    }
+                    if let Some(e) = &ey {
+                        pd.ys[i] = e.eval(vx, vy);
+                    }
+                }
+                pd.retain(|xs, ys, i| xs[i].is_finite() && ys[i].is_finite());
+                if ex.is_some() {
+                    x_time = false;
+                }
+            }
+            // 값 › 이상치 빼기 (y 기준)
+            if o.value.outlier {
+                let (lo, hi) = crate::analytics::outlier_bounds(&pd.ys, o.value.outlier_method, o.value.outlier_k);
+                pd.retain(|_, ys, i| ys[i] >= lo && ys[i] <= hi);
+            }
+            // 지운 영역 (scatter, line)
+            if !state.deletions.is_empty() && spec.can_delete() {
+                let tests: Vec<_> = state.deletions.iter().map(|r| r.tester()).collect();
+                pd.retain(|xs, ys, i| !tests.iter().any(|t| t(xs[i], ys[i])));
+            }
+            // line 분포 하위 차트: x = 원래 y 값, y = 누적 비율 등
+            if let Some(kind) = spec.distribution() {
+                let d = crate::analytics::to_distribution(kind, &pd.ys, pd.legend.as_deref());
+                pd = crate::query::points::PointsData {
+                    xs: d.iter().map(|p| p.1).collect(),
+                    ys: d.iter().map(|p| p.2).collect(),
+                    ids: d.iter().map(|p| pd.ids[p.0]).collect(),
+                    legend: pd.legend.as_ref().map(|l| d.iter().map(|p| l[p.0]).collect()),
+                };
+                x_time = false;
+            }
+            // 새 범례: 영역 안의 점을 새 legend 항목으로 (legend 컬럼이 없으면 나머지는 '기타')
+            if !state.legend_groups.is_empty() {
+                let mut values = data.legend_values.clone().unwrap_or_else(|| vec!["기타".to_string()]);
+                let base = values.len();
+                let mut colors = base_colors(&values);
+                if data.legend_values.is_none() {
+                    colors[0] = color;
+                }
+                let tests: Vec<_> = state.legend_groups.iter().map(|g| g.region.tester()).collect();
+                let mut codes = pd.legend.take().unwrap_or_else(|| vec![0; pd.xs.len()]);
+                for i in 0..pd.xs.len() {
+                    if let Some(k) = tests.iter().rposition(|t| t(pd.xs[i], pd.ys[i])) {
+                        codes[i] = (base + k).min(255) as u8;
+                    }
+                }
+                pd.legend = Some(codes);
+                for (k, g) in state.legend_groups.iter().enumerate() {
+                    values.push(g.name.clone());
+                    colors.push(palette(base + k));
+                }
+                legend = mk_legend(spec.legend.as_deref().unwrap_or(""), values, colors);
+            }
+            points_store = pd;
             ItemData::Points {
                 line: spec.chart_type == ChartType::Line,
-                x_time: *x_time,
+                x_time,
                 data: &points_store,
             }
         }
@@ -256,18 +340,8 @@ pub fn render_item(
             let item = &items[index];
             match spec.chart_type {
                 ChartType::Pie | ChartType::Funnel => {
-                    let colors = item
-                        .categories
-                        .iter()
-                        .enumerate()
-                        .map(|(i, c)| {
-                            if c == crate::query::category::OTHERS {
-                                OTHERS_COLOR
-                            } else {
-                                palette(i)
-                            }
-                        })
-                        .collect();
+                    // sunburst는 legend 컬럼 값별 색 (바깥 고리)도 함께 쓴다: 조각 색은 범주, 바깥은 legend 값
+                    let colors = base_colors(&item.categories);
                     legend = mk_legend(&spec.x, item.categories.clone(), colors);
                 }
                 ChartType::Waterfall => {
@@ -293,18 +367,7 @@ pub fn render_item(
         Payload::Gantt(items) => ItemData::Gantt(&items[index]),
         Payload::Sankey(items) => {
             let item = &items[index];
-            let colors = item
-                .sources
-                .iter()
-                .enumerate()
-                .map(|(i, s)| {
-                    if s == crate::query::category::OTHERS {
-                        OTHERS_COLOR
-                    } else {
-                        palette(i)
-                    }
-                })
-                .collect();
+            let colors = base_colors(&item.sources);
             legend = mk_legend(&spec.x, item.sources.clone(), colors);
             ItemData::Sankey(item)
         }
@@ -316,14 +379,26 @@ pub fn render_item(
         scale: opts.scale,
         theme: opts.theme,
         compact,
-        title: data.item_name(index),
+        title: data.item_name_with(index, opts.separator.as_deref().unwrap_or(&data.spec.split_separator)),
         color,
         alpha,
         legend,
         view: state.view,
-        x_title: spec.x.clone(),
-        y_title: spec.y.clone(),
+        x_title: match spec.distribution() {
+            Some(_) => spec.y.clone(),
+            None => spec.x.clone(),
+        },
+        y_title: match spec.distribution() {
+            Some(k) => k.y_title().to_string(),
+            None => spec.y.clone(),
+        },
         data: item_data,
+        options: o.clone(),
+        sub_type: spec.sub_type(),
+        selection: state.selection.clone(),
+        shapes: state.shapes.clone(),
+        aux_labels: data.legend_values.clone().unwrap_or_default(),
+        agg: spec.chart_type.fields().agg.then_some(spec.agg),
     };
     render(&input, &|_| {})
 }
@@ -575,4 +650,103 @@ pub fn render_once(data: &ChartData, i: usize, state: &ItemState, opts: &RenderO
         ms: 0.0,
         worker,
     }
+}
+
+/// 데이터 표·다운로드의 대상 행 (원본 server/data/item-rows.ts).
+/// item의 행에서 숨긴 legend 값과 지운 영역의 점을 빼고, 선택 영역이 있고 그 차트가 선택으로 행을 거르면
+/// 선택 안의 행만 남긴다. 두 번째 값은 선택으로 걸렀는지 (파일 이름 `_선택`).
+pub fn item_rows(data: &ChartData, index: usize, state: &ItemState) -> (Vec<u32>, bool) {
+    let ds = &data.dataset;
+    let spec = &data.spec;
+    let mut rows = data.groups.rows_of(index).to_vec();
+    let legend = spec.legend_column().and_then(|l| ds.column(l));
+    if let Some(col) = legend.filter(|_| !state.hidden_legend.is_empty()) {
+        rows.retain(|&r| !state.hidden_legend.contains(&col.text_at(r as usize)));
+    }
+    let xy = |r: u32| -> Option<(f64, f64)> {
+        let x = ds.column(&spec.x)?.nums()?[r as usize];
+        let y = ds.column(&spec.y)?.nums()?[r as usize];
+        Some((x, y))
+    };
+    if spec.can_delete() && !state.deletions.is_empty() {
+        let tests: Vec<_> = state.deletions.iter().map(|r| r.tester()).collect();
+        rows.retain(|&r| xy(r).is_none_or(|(x, y)| !tests.iter().any(|t| t(x, y))));
+    }
+    let Some(sel) = state.selection.as_ref().filter(|_| spec.filters_rows_by_selection()) else {
+        return (rows, false);
+    };
+    let test = sel.tester();
+    match (&data.payload, spec.chart_type) {
+        (Payload::Points { .. }, _) => rows.retain(|&r| xy(r).is_some_and(|(x, y)| test(x, y))),
+        (Payload::Category(items), ChartType::Waterfall) => {
+            // 막대 끝 = 누적 값
+            let item = &items[index];
+            let mut cum = 0.0;
+            let mut keep = std::collections::HashSet::new();
+            for (i, b) in item.bars.iter().enumerate() {
+                cum += b[0].unwrap_or(0.0);
+                if test(i as f64, cum) {
+                    keep.insert(item.categories[i].clone());
+                }
+            }
+            if let Some(xc) = ds.column(&spec.x) {
+                rows.retain(|&r| keep.contains(&xc.text_at(r as usize)));
+            }
+        }
+        (Payload::Category(items), _) => {
+            // 막대 끝 · 상자 중앙값이 영역 안인 (범주, legend 값)
+            let item = &items[index];
+            let lvals = data.legend_values.clone().unwrap_or_default();
+            let mut keep = std::collections::HashSet::new();
+            for (i, c) in item.categories.iter().enumerate() {
+                let width = item
+                    .bars
+                    .get(i)
+                    .map(|b| b.len())
+                    .or(item.boxes.get(i).map(|b| b.len()))
+                    .unwrap_or(1);
+                for g in 0..width {
+                    let v = match spec.chart_type {
+                        ChartType::Boxplot => item.boxes[i][g].as_ref().map(|b| b.median),
+                        _ => item.bars[i][g],
+                    };
+                    if v.is_some_and(|v| test(i as f64, v)) {
+                        keep.insert((c.clone(), lvals.get(g).cloned()));
+                    }
+                }
+            }
+            if let Some(xc) = ds.column(&spec.x) {
+                rows.retain(|&r| {
+                    let l = legend.map(|col| col.text_at(r as usize));
+                    keep.contains(&(xc.text_at(r as usize), l))
+                });
+            }
+        }
+        (Payload::Histogram(bins, items), _) => {
+            let item = &items[index];
+            let lvals = data.legend_values.clone().unwrap_or_default();
+            let mut keep = std::collections::HashSet::new();
+            for (b, cell) in item.counts.iter().enumerate() {
+                for (g, &n) in cell.iter().enumerate() {
+                    let cx = (bins.edge(b) + bins.edge(b + 1)) / 2.0;
+                    if n > 0 && test(cx, n as f64) {
+                        keep.insert((b, g));
+                    }
+                }
+            }
+            if let Some(xs) = ds.column(&spec.x).and_then(|c| c.nums()) {
+                rows.retain(|&r| {
+                    let v = xs[r as usize];
+                    let b = (((v - bins.lo) / bins.step).floor().max(0.0) as usize).min(bins.count.saturating_sub(1));
+                    let g = legend
+                        .map(|col| col.text_at(r as usize))
+                        .and_then(|t| lvals.iter().position(|l| *l == t))
+                        .unwrap_or(0);
+                    keep.contains(&(b, g))
+                });
+            }
+        }
+        _ => return (rows, false),
+    }
+    (rows, true)
 }

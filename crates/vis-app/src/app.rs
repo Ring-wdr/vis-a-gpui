@@ -6,21 +6,22 @@ use std::time::Duration;
 
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::empty::{Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyMediaVariant, EmptyTitle};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::progress::Progress;
 use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::table::{Table, TableBody, TableCell, TableHead, TableHeader, TableRow};
-use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, Theme, ThemeMode, WindowExt as _, h_flex, v_flex,
-};
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _, Theme, ThemeMode, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use vis_core::history::History;
 use vis_core::store::{DatasetState, Store};
 
+use crate::assets::icon;
 use crate::bench_view::BenchView;
 use crate::ui::{fmt_bytes, fmt_int, fmt_ms};
 use crate::workspace::{Workspace, WorkspaceEvent};
+use gpui_kit::assets::IconName as Lucide;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Section {
@@ -42,6 +43,8 @@ pub struct VisApp {
     bench: Entity<BenchView>,
     working: HashSet<String>,
     poll: Option<Task<()>>,
+    /// datastore 이름 검색
+    ds_search: Entity<InputState>,
     _subs: Vec<Subscription>,
 }
 
@@ -51,6 +54,12 @@ impl VisApp {
         let store = Store::open(dir.clone());
         let history = Arc::new(History::open(dir));
         let bench = cx.new(|cx| BenchView::new(store.clone(), window, cx));
+        let ds_search = cx.new(|cx| InputState::new(window, cx).placeholder("이름 검색"));
+        let search_sub = cx.subscribe(&ds_search, |_, _, e: &InputEvent, cx| {
+            if matches!(e, InputEvent::Change) {
+                cx.notify();
+            }
+        });
         let mut app = Self {
             store,
             history,
@@ -62,7 +71,8 @@ impl VisApp {
             bench,
             working: HashSet::new(),
             poll: None,
-            _subs: vec![],
+            ds_search,
+            _subs: vec![search_sub],
         };
         app.new_tab(None, window, cx);
         app.section = Section::Start;
@@ -105,42 +115,20 @@ impl VisApp {
         self.start_poll(window, cx);
     }
 
-    fn upload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let rx = cx.prompt_for_paths(PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: false,
-            prompt: Some("CSV 파일 열기".into()),
+    /// 업로드 팝업 (edit가 있으면 수정 모드: 보관한 원본을 다시 적재)
+    fn upload(&mut self, edit: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let app = cx.entity().downgrade();
+        let on_done: Arc<dyn Fn(String, &mut Window, &mut App)> = Arc::new(move |name, window, cx| {
+            let _ = app.update(cx, |this, cx| {
+                this.section = Section::Datastore;
+                window.push_notification(format!("'{name}'을(를) 등록했습니다."), cx);
+                cx.notify();
+            });
         });
         let store = self.store.clone();
-        cx.spawn_in(window, async move |this, cx| {
-            let Ok(Ok(Some(paths))) = rx.await else { return };
-            let Some(path) = paths.into_iter().next() else { return };
-            let _ = this.update_in(cx, |this, window, cx| {
-                this.working.insert(format!("csv:{}", path.display()));
-                this.start_poll(window, cx);
-            });
-            let (tx, rx2) = futures_channel();
-            std::thread::spawn(move || {
-                let r = store.import_csv(&path, &vis_core::csv_import::CsvOptions::default());
-                let _ = tx.send((path, r.map(|d| d.name.clone())));
-            });
-            loop {
-                cx.background_executor().timer(Duration::from_millis(100)).await;
-                if let Ok((path, r)) = rx2.try_recv() {
-                    let _ = this.update_in(cx, |this, window, cx| {
-                        this.working.remove(&format!("csv:{}", path.display()));
-                        match r {
-                            Ok(name) => window.push_notification(format!("'{name}'을 등록했습니다."), cx),
-                            Err(e) => window.push_notification(format!("가져올 수 없습니다: {e}"), cx),
-                        }
-                        cx.notify();
-                    });
-                    break;
-                }
-            }
-        })
-        .detach();
+        let panel = cx.new(|cx| crate::upload::UploadPanel::new(store, edit, on_done, window, cx));
+        crate::upload::UploadPanel::open(panel, window, cx);
+        self.start_poll(window, cx);
     }
 
     fn start_poll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -254,8 +242,9 @@ impl VisApp {
 
     fn top_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let nav = |id: &'static str, label: &'static str, s: Section, cur: Section, cx: &mut Context<Self>| {
+        let nav = |id: &'static str, label: &'static str, ic: Lucide, s: Section, cur: Section, cx: &mut Context<Self>| {
             Button::new(id)
+                .icon(icon(ic))
                 .label(label)
                 .small()
                 .when(s == cur, |b| b.primary())
@@ -285,10 +274,24 @@ impl VisApp {
                         cx.notify();
                     })),
             )
-            .child(nav("nav-data", "datastore", Section::Datastore, self.section, cx))
-            .child(nav("nav-gallery", "gallery", Section::Gallery, self.section, cx))
-            .child(nav("nav-history", "history", Section::History, self.section, cx))
-            .child(nav("nav-bench", "벤치마크", Section::Bench, self.section, cx))
+            .child(nav("nav-data", "datastore", Lucide::Database, Section::Datastore, self.section, cx))
+            .child(nav(
+                "nav-gallery",
+                "gallery",
+                Lucide::LayoutGrid,
+                Section::Gallery,
+                self.section,
+                cx,
+            ))
+            .child(nav(
+                "nav-history",
+                "history",
+                Lucide::RotateCcwClock,
+                Section::History,
+                self.section,
+                cx,
+            ))
+            .child(nav("nav-bench", "벤치마크", Lucide::Gauge, Section::Bench, self.section, cx))
             .child(div().flex_1())
             .child(
                 div()
@@ -298,7 +301,7 @@ impl VisApp {
             )
             .child(
                 Button::new("theme")
-                    .icon(if dark { IconName::Sun } else { IconName::Moon })
+                    .icon(icon(if dark { Lucide::Sun } else { Lucide::Moon }))
                     .small()
                     .ghost()
                     .tooltip("화면 테마 (차트는 다음 draw부터)")
@@ -313,7 +316,7 @@ impl VisApp {
         let theme = cx.theme().clone();
         let ready = self.store.ready().len();
         let hist = self.history.list().len();
-        let card = |id: &'static str, title: &'static str, desc: String, s: Section, cx: &mut Context<Self>| {
+        let card = |id: &'static str, ic: Lucide, title: &'static str, desc: String, s: Section, cx: &mut Context<Self>| {
             v_flex()
                 .id(id)
                 .w(px(240.))
@@ -329,6 +332,7 @@ impl VisApp {
                     this.section = s;
                     cx.notify();
                 }))
+                .child(icon(ic).large().text_color(theme.primary))
                 .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
                 .child(div().text_sm().text_color(theme.muted_foreground).child(desc))
         };
@@ -349,6 +353,7 @@ impl VisApp {
                     .gap_4()
                     .child(card(
                         "c-gallery",
+                        Lucide::LayoutGrid,
                         "새 차트 그리기",
                         "gallery에서 설정을 고르고 draw".into(),
                         Section::Gallery,
@@ -356,6 +361,7 @@ impl VisApp {
                     ))
                     .child(card(
                         "c-history",
+                        Lucide::RotateCcwClock,
                         "기록 다시 보기",
                         format!("history {hist}건"),
                         Section::History,
@@ -363,6 +369,7 @@ impl VisApp {
                     ))
                     .child(card(
                         "c-data",
+                        Lucide::Database,
                         "데이터 관리",
                         format!("쓸 수 있는 데이터 {ready}개 · 샘플 등록 · CSV"),
                         Section::Datastore,
@@ -370,6 +377,7 @@ impl VisApp {
                     ))
                     .child(card(
                         "c-bench",
+                        Lucide::Gauge,
                         "성능 측정",
                         "웹(PGlite) 기준값과 같은 케이스 비교".into(),
                         Section::Bench,
@@ -383,12 +391,19 @@ impl VisApp {
         let theme = cx.theme().clone();
         // 데이터 목록 (gpui-kit Table): 업로드(최근 순) 다음에 샘플
         let mut body = TableBody::new();
-        for (info, state) in self.store.list() {
+        let q = self.ds_search.read(cx).value().trim().to_lowercase();
+        for (info, state) in self
+            .store
+            .list()
+            .into_iter()
+            .filter(|(i, _)| q.is_empty() || i.name.to_lowercase().contains(&q) || i.id.to_lowercase().contains(&q))
+        {
             let id = info.id.clone();
             let (id1, id2, id3) = (id.clone(), id.clone(), id.clone());
             let name = info.name.clone();
             let status: AnyElement = match &state {
                 DatasetState::Unregistered => Button::new(SharedString::from(format!("reg-{id}")))
+                    .icon(icon(Lucide::Database))
                     .label("등록 (생성)")
                     .small()
                     .primary()
@@ -403,14 +418,26 @@ impl VisApp {
                     .gap_1()
                     .child(
                         Button::new(SharedString::from(format!("open-{id}")))
+                            .icon(icon(Lucide::LayoutGrid))
                             .label("gallery에서 열기")
                             .small()
                             .primary()
                             .on_click(cx.listener(move |this, _, window, cx| this.new_tab(Some(id2.clone()), window, cx))),
                     )
+                    .when(!info.sample, |d| {
+                        let id4 = id.clone();
+                        d.child(
+                            Button::new(SharedString::from(format!("edit-{id}")))
+                                .icon(icon(Lucide::Pencil))
+                                .small()
+                                .ghost()
+                                .tooltip("수정 (옵션·타입·포함 컬럼을 바꿔 다시 적재)")
+                                .on_click(cx.listener(move |this, _, window, cx| this.upload(Some(id4.clone()), window, cx))),
+                        )
+                    })
                     .child(
                         Button::new(SharedString::from(format!("del-{id}")))
-                            .icon(IconName::Delete)
+                            .icon(icon(Lucide::Trash))
                             .small()
                             .ghost()
                             .tooltip("삭제")
@@ -432,6 +459,11 @@ impl VisApp {
                             )),
                         )),
                     )
+                    .child(TableCell::new().w(px(170.)).child(if info.created_ms > 0 {
+                        vis_core::timefmt::format_kst(info.created_ms as f64, "%Y-%m-%d %H:%M")
+                    } else {
+                        "-".into()
+                    }))
                     .child(TableCell::new().w(px(120.)).text_right().child(fmt_int(info.rows)))
                     .child(
                         TableCell::new()
@@ -444,7 +476,7 @@ impl VisApp {
                     } else {
                         "-".into()
                     }))
-                    .child(TableCell::new().w(px(280.)).child(status)),
+                    .child(TableCell::new().w(px(330.)).child(status)),
             );
         }
         let rows = Table::new()
@@ -452,10 +484,11 @@ impl VisApp {
                 TableHeader::new().child(
                     TableRow::new()
                         .child(TableHead::new().child("이름"))
+                        .child(TableHead::new().w(px(170.)).child("등록 시간"))
                         .child(TableHead::new().w(px(120.)).text_right().child("행 수"))
                         .child(TableHead::new().w(px(100.)).text_right().child("크기"))
                         .child(TableHead::new().w(px(110.)).text_right().child("적재 시간"))
-                        .child(TableHead::new().w(px(280.)).child("상태")),
+                        .child(TableHead::new().w(px(330.)).child("상태")),
                 ),
             )
             .child(body);
@@ -468,15 +501,25 @@ impl VisApp {
                 h_flex()
                     .gap_2()
                     .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child("datastore"))
+                    .child(div().w(px(260.)).child(Input::new(&self.ds_search).small().cleanable(true)))
                     .child(div().flex_1())
                     .child(
+                        Button::new("ds-refresh")
+                            .icon(icon(Lucide::RotateCcw))
+                            .small()
+                            .ghost()
+                            .tooltip("새로고침")
+                            .on_click(cx.listener(|_, _, _, cx| cx.notify())),
+                    )
+                    .child(
                         Button::new("upload")
-                            .label(if csv_busy { "가져오는 중…" } else { "upload (CSV)" })
+                            .icon(icon(Lucide::FileUp))
+                            .label(if csv_busy { "가져오는 중…" } else { "upload (CSV · zip)" })
                             .small()
                             .outline()
                             .loading(csv_busy)
                             .disabled(csv_busy)
-                            .on_click(cx.listener(|this, _, window, cx| this.upload(window, cx))),
+                            .on_click(cx.listener(|this, _, window, cx| this.upload(None, window, cx))),
                     ),
             )
             .child(div().text_xs().text_color(theme.muted_foreground).child(format!(
@@ -506,7 +549,7 @@ impl VisApp {
                     .when(closable, |t| {
                         t.suffix(
                             Button::new(SharedString::from(format!("close-{i}")))
-                                .icon(IconName::Close)
+                                .icon(icon(Lucide::X))
                                 .xsmall()
                                 .ghost()
                                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -519,7 +562,7 @@ impl VisApp {
         }
         let bar = bar.suffix(
             Button::new("new-tab")
-                .icon(IconName::Plus)
+                .icon(icon(Lucide::Plus))
                 .xsmall()
                 .ghost()
                 .tooltip("새 탭")
@@ -546,7 +589,7 @@ impl VisApp {
                         .media(
                             EmptyMedia::new()
                                 .with_variant(EmptyMediaVariant::Icon)
-                                .child(Icon::new(IconName::Inbox)),
+                                .child(Icon::new(Lucide::RotateCcwClock)),
                         )
                         .title(EmptyTitle::new().child("기록 없음"))
                         .description(EmptyDescription::new().child("gallery에서 draw하면 여기에 남습니다.")),
@@ -587,6 +630,7 @@ impl VisApp {
                             .gap_1()
                             .child(
                                 Button::new(SharedString::from(format!("he-{}", e.id)))
+                                    .icon(icon(Lucide::LayoutGrid))
                                     .label("gallery에서 편집")
                                     .xsmall()
                                     .outline()
@@ -597,7 +641,7 @@ impl VisApp {
                             )
                             .child(
                                 Button::new(SharedString::from(format!("hd-{}", e.id)))
-                                    .icon(IconName::Delete)
+                                    .icon(icon(Lucide::Trash))
                                     .xsmall()
                                     .ghost()
                                     .tooltip("삭제")
@@ -657,9 +701,4 @@ impl Render for VisApp {
             .child(self.top_bar(cx))
             .child(div().flex_1().min_h_0().child(body))
     }
-}
-
-/// 스레드에서 결과 하나를 받는 채널 (std mpsc를 비동기 폴링으로 읽는다)
-fn futures_channel<T>() -> (std::sync::mpsc::Sender<T>, std::sync::mpsc::Receiver<T>) {
-    std::sync::mpsc::channel()
 }

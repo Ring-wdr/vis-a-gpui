@@ -2,12 +2,17 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
+mod assets;
 mod bench_view;
 mod data_table;
+mod export;
 mod filters;
+mod option_fields;
+mod options_form;
 mod picker;
 mod settings;
 mod ui;
+mod upload;
 mod workspace;
 
 use gpui_kit::*;
@@ -17,7 +22,7 @@ fn main() {
     std::thread::spawn(|| {
         let _ = vis_core::render::text::fonts();
     });
-    gpui_kit::application().with_assets(gpui_kit::assets::Assets).run(|cx| {
+    gpui_kit::application().with_assets(assets::AppAssets).run(|cx| {
         gpui_kit::init(cx);
         let bounds = Bounds::centered(None, size(px(1440.), px(900.)), cx);
         let options = WindowOptions {

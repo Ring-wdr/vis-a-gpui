@@ -26,3 +26,31 @@ pub fn gather(rows: &[u32], x: &[f64], y: &[f64], legend: Option<&LegendCodes>) 
         legend: legend.map(|l| rows.iter().map(|&r| l.at(r).min(255) as u8).collect()),
     }
 }
+
+impl PointsData {
+    /// keep(xs, ys, i)가 참인 점만 남긴다
+    pub fn retain(&mut self, keep: impl Fn(&[f64], &[f64], usize) -> bool) {
+        let mask: Vec<bool> = (0..self.xs.len()).map(|i| keep(&self.xs, &self.ys, i)).collect();
+        let pick = |v: &mut Vec<f64>| {
+            let mut k = 0;
+            v.retain(|_| {
+                k += 1;
+                mask[k - 1]
+            });
+        };
+        pick(&mut self.xs);
+        pick(&mut self.ys);
+        let mut k = 0;
+        self.ids.retain(|_| {
+            k += 1;
+            mask[k - 1]
+        });
+        if let Some(l) = &mut self.legend {
+            let mut k = 0;
+            l.retain(|_| {
+                k += 1;
+                mask[k - 1]
+            });
+        }
+    }
+}

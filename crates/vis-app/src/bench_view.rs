@@ -233,7 +233,7 @@ impl Render for BenchView {
                         this.rows = 1_000_000;
                         cx.notify();
                     })))
-                    .child(Button::new("b-run").label("측정 시작").small().primary().loading(running).disabled(running).on_click(cx.listener(|this, _, window, cx| this.run(window, cx))))
+                    .child(Button::new("b-run").icon(crate::assets::icon(gpui_kit::assets::IconName::Play)).label("측정 시작").small().primary().loading(running).disabled(running).on_click(cx.listener(|this, _, window, cx| this.run(window, cx))))
                     .child(div().text_sm().text_color(theme.muted_foreground).child(self.status.clone())),
             )
             .child(table)

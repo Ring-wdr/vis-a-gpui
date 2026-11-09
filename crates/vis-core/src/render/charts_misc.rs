@@ -3,33 +3,33 @@
 use tiny_skia::PathBuilder;
 
 use super::canvas::{Align, Canvas, polygon};
-use super::frame::{self, FONT, draw_category_labels, draw_row_labels, draw_title, draw_x_axis, draw_y_axis, frame_plot};
+use super::frame::{self, FONT, draw_category_labels, draw_row_labels, frame_plot};
 use super::meta::{AxisKind, AxisMeta, Hit, HitShape, ItemMeta, RectF};
 use super::scale::{Linear, extent, number_format, short_number, time_ticks};
 use super::text;
-use super::theme::{OTHERS_COLOR, Theme, luminance, mix, palette, sequential};
+use super::theme::{OTHERS_COLOR, Style, luminance, mix, palette, sequential};
 use super::{ItemRender, legend_name, series_color, visible};
 use crate::query::candle::CandleItem;
 use crate::query::category::{CategoryItem, OTHERS};
 use crate::query::gantt::GanttItem;
 use crate::query::heatmap::HeatItem;
 use crate::query::sankey::SankeyItem;
-use crate::timefmt::{axis_format, format_kst};
+use crate::timefmt::format_kst;
 
 fn ink_on(c: u32) -> u32 {
     if luminance(c) > 0.6 { 0x0b0b0b } else { 0xffffff }
 }
 
-pub fn render_heatmap(c: &mut Canvas, t: &Theme, input: &ItemRender, item: &HeatItem) -> ItemMeta {
+pub fn render_heatmap(c: &mut Canvas, t: &Style, input: &ItemRender, item: &HeatItem) -> ItemMeta {
     let left = if input.compact {
         0.0
     } else {
-        frame::label_width(item.ys.iter().cloned()).min(90.0)
+        frame::row_label_width(t, item.ys.iter().cloned()).min(90.0)
     };
     let plot = if input.compact {
         frame::compact_plot(input.width, input.height)
     } else {
-        frame_plot(input.width, input.height, left, None, true)
+        frame_plot(t, input.width, input.height, left, None, true)
     };
     let (lo, hi) = extent(item.cells.iter().flatten().flatten().copied(), false);
     let mut meta = ItemMeta::new(input.width, input.height, plot);
@@ -45,18 +45,29 @@ pub fn render_heatmap(c: &mut Canvas, t: &Theme, input: &ItemRender, item: &Heat
     let cw = plot.w / nx;
     let ch = plot.h / ny;
     if !input.compact {
-        draw_title(c, t, &input.title, &summary);
         draw_category_labels(c, t, plot, &item.xs, |i| plot.x + cw * (i as f32 + 0.5), cw);
         draw_row_labels(c, t, plot, &item.ys, |j| plot.y + ch * (j as f32 + 0.5), left);
     }
     if item.xs.is_empty() {
         frame::draw_empty(c, t, plot);
     }
+    // 팔레트 › 그라데이션을 쓰면 시작 → (중간) → 끝 색으로 값을 칠한다
+    let pal = &t.o.palette;
+    let scale = |f: f32| {
+        if pal.gradient {
+            let g = super::theme::gradient_palette(pal, 64);
+            g[((f.clamp(0.0, 1.0) * 63.0).round() as usize).min(63)]
+        } else {
+            sequential(f)
+        }
+    };
     for (i, col) in item.cells.iter().enumerate() {
         for (j, v) in col.iter().enumerate() {
-            let Some(v) = v else { continue };
+            // 값 › 빈 칸 값
+            let Some(v) = v.or(t.o.value.null_numeric) else { continue };
+            let v = &v;
             let f = ((v - lo) / (hi - lo)) as f32;
-            let color = sequential(f);
+            let color = scale(f);
             let r = RectF::new(plot.x + cw * i as f32, plot.y + ch * j as f32, cw, ch);
             c.fill_rect(
                 r.x,
@@ -68,7 +79,11 @@ pub fn render_heatmap(c: &mut Canvas, t: &Theme, input: &ItemRender, item: &Heat
             );
             if !input.compact && cw > 34.0 && ch > 14.0 {
                 c.text(
-                    &short_number(*v),
+                    &if t.o.point_label.visible {
+                        super::charts_points::label_text(&t.o.point_label, *v)
+                    } else {
+                        short_number(*v)
+                    },
                     r.x + cw / 2.0,
                     r.y + ch / 2.0 + 4.0,
                     FONT - 1.0,
@@ -87,7 +102,7 @@ pub fn render_heatmap(c: &mut Canvas, t: &Theme, input: &ItemRender, item: &Heat
     meta
 }
 
-pub fn render_candle(c: &mut Canvas, t: &Theme, input: &ItemRender, item: &CandleItem) -> ItemMeta {
+pub fn render_candle(c: &mut Canvas, t: &Style, input: &ItemRender, item: &CandleItem) -> ItemMeta {
     let cs = &item.candles;
     let interval = if cs.len() >= 2 { cs[1].t - cs[0].t } else { 3_600_000.0 };
     let (xd, yd) = match input.view {
@@ -97,32 +112,42 @@ pub fn render_candle(c: &mut Canvas, t: &Theme, input: &ItemRender, item: &Candl
             extent(cs.iter().flat_map(|k| [k.low, k.high]), false),
         ),
     };
-    let mut ys = Linear::new(yd, (1.0, 0.0));
-    if input.view.is_none() {
-        ys = ys.nice(5);
+    let ya = &t.o.axes.y;
+    let yd = if input.view.is_none() { frame::axis_domain(ya, yd) } else { yd };
+    let mut ys = Linear::new(yd, (1.0, 0.0)).with_log(ya.log);
+    if input.view.is_none() && ya.min.is_none() && ya.max.is_none() {
+        ys = ys.nice(frame::y_tick_count(t));
     }
-    let ticks = ys.ticks(5);
+    let ticks = ys.ticks(frame::y_tick_count(t));
     let fmt = number_format(&ticks);
     let left = if input.compact {
         0.0
     } else {
-        frame::label_width(ticks.iter().map(|&v| fmt(v)))
+        frame::label_width(t, ticks.iter().map(|&v| (v, fmt(v))))
     };
     let plot = if input.compact {
         frame::compact_plot(input.width, input.height)
     } else {
-        frame_plot(input.width, input.height, left, input.legend.as_ref(), true)
+        frame_plot(t, input.width, input.height, left, input.legend.as_ref(), true)
     };
-    let ys = Linear::new((ys.d0, ys.d1), (plot.bottom() as f64, plot.y as f64));
+    let ys = ys.with_range((plot.bottom() as f64, plot.y as f64));
     let xs = Linear::new(xd, (plot.x as f64, plot.right() as f64));
-    let x_ticks = time_ticks(xs.d0, xs.d1, ((plot.w / 90.0) as usize).max(2));
+    let x_ticks = time_ticks(xs.d0, xs.d1, frame::x_tick_count(t, plot));
     let span = xs.d1 - xs.d0;
     let mut meta = ItemMeta::new(input.width, input.height, plot);
     let summary = format!("{}개 구간", cs.len());
     if !input.compact {
-        draw_y_axis(c, t, plot, |v| ys.map(v) as f32, &ticks, &fmt);
-        draw_x_axis(c, t, plot, |v| xs.map(v) as f32, &x_ticks, &|v| format_kst(v, axis_format(span)));
-        draw_title(c, t, &input.title, &summary);
+        frame::draw_y_axis_titled(c, t, plot, |v| ys.map(v) as f32, &ticks, &fmt, &input.y_title);
+        let date = frame::date_fmt(t, span).to_string();
+        frame::draw_x_axis_titled(
+            c,
+            t,
+            plot,
+            |v| xs.map(v) as f32,
+            &x_ticks,
+            &|v| format_kst(v, &date),
+            &input.x_title,
+        );
         if let Some(l) = &input.legend {
             meta.legend = frame::draw_legend(c, t, l, plot);
         }
@@ -143,9 +168,13 @@ pub fn render_candle(c: &mut Canvas, t: &Theme, input: &ItemRender, item: &Candl
         if cx < plot.x - bw || cx > plot.right() + bw {
             continue;
         }
-        c.line(cx, ys.map(k.high) as f32, cx, ys.map(k.low) as f32, color, 1.0);
+        c.line(cx, ys.map(k.high) as f32, cx, ys.map(k.low) as f32, color, t.o.size.line_width);
         let (yo, yc) = (ys.map(k.open) as f32, ys.map(k.close) as f32);
         c.fill_rect(cx - bw / 2.0, yo.min(yc), bw, (yo - yc).abs().max(1.0), color, input.alpha);
+        if t.o.point_label.visible && !input.compact {
+            let s = super::charts_points::label_text(&t.o.point_label, k.close);
+            super::charts_points::draw_label(c, t, &s, cx, yo.min(yc));
+        }
         meta.hits.push(Hit {
             shape: HitShape::Rect(RectF::new(
                 cx - bw / 2.0 - 1.0,
@@ -177,7 +206,7 @@ pub fn render_candle(c: &mut Canvas, t: &Theme, input: &ItemRender, item: &Candl
     meta
 }
 
-pub fn render_gantt(c: &mut Canvas, t: &Theme, input: &ItemRender, item: &GanttItem) -> ItemMeta {
+pub fn render_gantt(c: &mut Canvas, t: &Style, input: &ItemRender, item: &GanttItem) -> ItemMeta {
     let n = item.rows.len();
     let (xd, yd) = match input.view {
         Some(v) => (v.x, v.y),
@@ -189,24 +218,32 @@ pub fn render_gantt(c: &mut Canvas, t: &Theme, input: &ItemRender, item: &GanttI
     let left = if input.compact {
         0.0
     } else {
-        frame::label_width(item.rows.iter().cloned()).min(90.0)
+        frame::row_label_width(t, item.rows.iter().cloned()).min(90.0)
     };
     let plot = if input.compact {
         frame::compact_plot(input.width, input.height)
     } else {
-        frame_plot(input.width, input.height, left, input.legend.as_ref(), true)
+        frame_plot(t, input.width, input.height, left, input.legend.as_ref(), true)
     };
     let xs = Linear::new(xd, (plot.x as f64, plot.right() as f64));
     let ys = Linear::new(yd, (plot.y as f64, plot.bottom() as f64));
-    let x_ticks = time_ticks(xs.d0, xs.d1, ((plot.w / 90.0) as usize).max(2));
+    let x_ticks = time_ticks(xs.d0, xs.d1, frame::x_tick_count(t, plot));
     let span = xs.d1 - xs.d0;
     let mut meta = ItemMeta::new(input.width, input.height, plot);
     let summary = format!("{}행 · {}구간", n, item.bars.len());
     let band = (ys.map(1.0) - ys.map(0.0)).abs() as f32;
     if !input.compact {
-        draw_x_axis(c, t, plot, |v| xs.map(v) as f32, &x_ticks, &|v| format_kst(v, axis_format(span)));
+        let date = frame::date_fmt(t, span).to_string();
+        frame::draw_x_axis_titled(
+            c,
+            t,
+            plot,
+            |v| xs.map(v) as f32,
+            &x_ticks,
+            &|v| format_kst(v, &date),
+            &input.x_title,
+        );
         draw_row_labels(c, t, plot, &item.rows, |j| ys.map(j as f64) as f32, left);
-        draw_title(c, t, &input.title, &summary);
         if let Some(l) = &input.legend {
             meta.legend = frame::draw_legend(c, t, l, plot);
         }
@@ -222,7 +259,15 @@ pub fn render_gantt(c: &mut Canvas, t: &Theme, input: &ItemRender, item: &GanttI
         let (row, g, x0, x1, count) = p;
         let color = series_color(input, g as usize);
         let cy = ys.map(row as f64) as f32;
-        c.fill_rect(x0, cy - bh / 2.0, (x1 - x0).max(1.0), bh, color, input.alpha);
+        if let Some(p) = super::canvas::rounded_rect(
+            x0,
+            cy - bh / 2.0,
+            (x1 - x0).max(1.0),
+            bh,
+            t.o.shape.corner_radius.min(bh / 4.0).min((x1 - x0) / 2.0).max(0.0),
+        ) {
+            super::charts_category::fill_shape(c, t, &p, color, input.alpha);
+        }
         if meta.hits.len() < 30_000 {
             let mut lines = vec![item.rows[row as usize].clone()];
             if let Some(n) = legend_name(input, g as usize) {
@@ -339,11 +384,11 @@ fn squarify(values: &[f64], r: RectF) -> Vec<RectF> {
     out
 }
 
-pub fn render_treemap(c: &mut Canvas, t: &Theme, input: &ItemRender, item: &CategoryItem) -> ItemMeta {
+pub fn render_treemap(c: &mut Canvas, t: &Style, input: &ItemRender, item: &CategoryItem) -> ItemMeta {
     let plot = if input.compact {
         frame::compact_plot(input.width, input.height)
     } else {
-        frame_plot(input.width, input.height, 0.0, input.legend.as_ref(), false)
+        frame_plot(t, input.width, input.height, 0.0, input.legend.as_ref(), false)
     };
     let mut meta = ItemMeta::new(input.width, input.height, plot);
     let width = item.bars.first().map(|b| b.len()).unwrap_or(1);
@@ -363,7 +408,6 @@ pub fn render_treemap(c: &mut Canvas, t: &Theme, input: &ItemRender, item: &Cate
     let total: f64 = tiles.iter().map(|t| t.2).sum();
     let summary = format!("합계 {}", short_number(total));
     if !input.compact {
-        draw_title(c, t, &input.title, &summary);
         if let Some(l) = &input.legend {
             meta.legend = frame::draw_legend(c, t, l, plot);
         }
@@ -407,12 +451,19 @@ pub fn render_treemap(c: &mut Canvas, t: &Theme, input: &ItemRender, item: &Cate
             } else {
                 color
             };
-            c.fill_rect(r.x, r.y, (r.w - 1.0).max(0.5), (r.h - 1.0).max(0.5), fill, input.alpha);
+            if let Some(p) = super::canvas::rounded_rect(r.x, r.y, (r.w - 1.0).max(0.5), (r.h - 1.0).max(0.5), 0.0) {
+                super::charts_category::fill_shape(c, t, &p, fill, input.alpha);
+            }
             if !input.compact && r.w > 40.0 && r.h > 18.0 {
                 let s = text::truncate(&item.categories[i], FONT, r.w - 8.0);
                 c.text(&s, r.x + 4.0, r.y + 14.0, FONT, ink_on(fill), Align::Left);
                 if r.h > 32.0 {
-                    c.text(&short_number(v), r.x + 4.0, r.y + 28.0, FONT - 1.0, ink_on(fill), Align::Left);
+                    let s = if t.o.point_label.visible {
+                        super::charts_points::label_text(&t.o.point_label, v)
+                    } else {
+                        short_number(v)
+                    };
+                    c.text(&s, r.x + 4.0, r.y + 28.0, FONT - 1.0, ink_on(fill), Align::Left);
                 }
             }
             let mut lines = vec![item.categories[i].clone()];
@@ -431,11 +482,11 @@ pub fn render_treemap(c: &mut Canvas, t: &Theme, input: &ItemRender, item: &Cate
     meta
 }
 
-pub fn render_funnel(c: &mut Canvas, t: &Theme, input: &ItemRender, item: &CategoryItem) -> ItemMeta {
+pub fn render_funnel(c: &mut Canvas, t: &Style, input: &ItemRender, item: &CategoryItem) -> ItemMeta {
     let plot = if input.compact {
         frame::compact_plot(input.width, input.height)
     } else {
-        frame_plot(input.width, input.height, 0.0, input.legend.as_ref(), false)
+        frame_plot(t, input.width, input.height, 0.0, input.legend.as_ref(), false)
     };
     let mut meta = ItemMeta::new(input.width, input.height, plot);
     let stages: Vec<(usize, f64)> = item
@@ -449,7 +500,6 @@ pub fn render_funnel(c: &mut Canvas, t: &Theme, input: &ItemRender, item: &Categ
     let max = stages.iter().map(|s| s.1).fold(0.0, f64::max);
     let summary = format!("{}단계", stages.len());
     if !input.compact {
-        draw_title(c, t, &input.title, &summary);
         if let Some(l) = &input.legend {
             meta.legend = frame::draw_legend(c, t, l, plot);
         }
@@ -483,7 +533,9 @@ pub fn render_funnel(c: &mut Canvas, t: &Theme, input: &ItemRender, item: &Categ
                 );
             }
         }
-        c.fill_rect(cx - w / 2.0, y, w.max(1.0), bh, color, input.alpha);
+        if let Some(p) = super::canvas::rounded_rect(cx - w / 2.0, y, w.max(1.0), bh, t.o.shape.corner_radius.min(bh / 2.0)) {
+            super::charts_category::fill_shape(c, t, &p, color, input.alpha);
+        }
         if !input.compact && bh > 12.0 {
             let label = format!("{} · {} ({:.0}%)", item.categories[i], short_number(v), v / first * 100.0);
             let tw = text::measure(&label, FONT);
@@ -509,18 +561,17 @@ pub fn render_funnel(c: &mut Canvas, t: &Theme, input: &ItemRender, item: &Categ
     meta
 }
 
-pub fn render_sankey(c: &mut Canvas, t: &Theme, input: &ItemRender, item: &SankeyItem) -> ItemMeta {
+pub fn render_sankey(c: &mut Canvas, t: &Style, input: &ItemRender, item: &SankeyItem) -> ItemMeta {
     let plot = if input.compact {
         frame::compact_plot(input.width, input.height)
     } else {
-        frame_plot(input.width, input.height, 0.0, input.legend.as_ref(), false)
+        frame_plot(t, input.width, input.height, 0.0, input.legend.as_ref(), false)
     };
     let mut meta = ItemMeta::new(input.width, input.height, plot);
     let flows: Vec<&(usize, usize, f64)> = item.flows.iter().filter(|f| visible(input, f.0)).collect();
     let total: f64 = flows.iter().map(|f| f.2).sum();
     let summary = format!("흐름 {}개", flows.len());
     if !input.compact {
-        draw_title(c, t, &input.title, &summary);
         if let Some(l) = &input.legend {
             meta.legend = frame::draw_legend(c, t, l, plot);
         }
@@ -583,6 +634,9 @@ pub fn render_sankey(c: &mut Canvas, t: &Theme, input: &ItemRender, item: &Sanke
         pb.close();
         if let Some(p) = pb.finish() {
             c.fill_path(&p, color, 0.38 * input.alpha.max(0.3));
+            if t.o.shape.border_width > 0.0 {
+                c.stroke_path(&p, t.border_of(color), 0.8, t.o.shape.border_width, None);
+            }
         }
         meta.hits.push(Hit {
             shape: HitShape::Polygon(vec![
